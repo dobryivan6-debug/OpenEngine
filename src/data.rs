@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -29,15 +30,35 @@ pub fn active() -> String {
 }
 
 pub fn theme() -> usize {
-    match fs::read_to_string(root().join("theme.txt"))
+    usize::from(fs::read_to_string(root().join("theme.txt")).is_ok_and(|s| s.trim() == "dark"))
+}
+
+pub fn language() -> usize {
+    match fs::read_to_string(root().join("language.txt"))
         .ok()
         .as_deref()
         .map(str::trim)
     {
-        Some("peach") => 1,
-        Some("mint") => 2,
+        Some("en") => 1,
+        Some("zh-CN") => 2,
         _ => 0,
     }
+}
+
+pub fn save_language(index: usize) -> io::Result<()> {
+    write_setting("language.txt", ["ru", "en", "zh-CN"][index])
+}
+
+pub fn quality() -> crate::video::Quality {
+    if fs::read_to_string(root().join("quality.txt")).is_ok_and(|s| s.trim() == "low") {
+        crate::video::Quality::Low
+    } else {
+        crate::video::Quality::Detail
+    }
+}
+
+pub fn save_quality(low: bool) -> io::Result<()> {
+    write_setting("quality.txt", if low { "low" } else { "detail" })
 }
 
 pub fn select(id: &str) -> io::Result<()> {
@@ -45,7 +66,7 @@ pub fn select(id: &str) -> io::Result<()> {
 }
 
 pub fn save_theme(theme: usize) -> io::Result<()> {
-    write_setting("theme.txt", ["frost", "peach", "mint"][theme])
+    write_setting("theme.txt", ["white", "dark"][theme])
 }
 
 fn write_setting(name: &str, value: &str) -> io::Result<()> {
@@ -73,15 +94,22 @@ fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-pub fn video_for(id: &str) -> Option<PathBuf> {
+pub fn media_for(id: &str) -> Option<PathBuf> {
     if !valid_id(id) {
         return None;
     }
     let dir = root().join(id);
-    ["video.mp4", "video.m4v", "video.wmv"]
-        .into_iter()
-        .map(|name| dir.join(name))
-        .find(|path| path.is_file())
+    [
+        "video.mp4",
+        "video.m4v",
+        "video.wmv",
+        "video.webm",
+        "video.mkv",
+        "image.bgr",
+    ]
+    .into_iter()
+    .map(|name| dir.join(name))
+    .find(|path| path.is_file())
 }
 
 pub fn thumbnail(entry: &Entry) -> Option<Vec<u8>> {
@@ -97,18 +125,18 @@ pub fn thumbnail(entry: &Entry) -> Option<Vec<u8>> {
 pub fn entries() -> Vec<Entry> {
     let mut items = vec![Entry {
         id: "winter".into(),
-        title: "Зимняя ночь".into(),
+        title: t("Зимняя ночь", "Winter Night", "冬夜").into(),
         path: None,
     }];
     if let Ok(dirs) = fs::read_dir(root()) {
         for dir in dirs.flatten() {
             let id = dir.file_name().to_string_lossy().into_owned();
-            let Some(path) = video_for(&id) else { continue };
+            let Some(path) = media_for(&id) else { continue };
             let title = fs::read_to_string(dir.path().join("entry.json"))
                 .ok()
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
                 .and_then(|json| json["Title"].as_str().map(str::to_owned))
-                .unwrap_or_else(|| "Локальное видео".into());
+                .unwrap_or_else(|| t("Локальное видео", "Local video", "本地视频").into());
             items.push(Entry {
                 id,
                 title,
@@ -126,10 +154,18 @@ pub fn import(source: &Path) -> io::Result<String> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !["mp4", "m4v", "wmv"].contains(&ext.as_str()) {
+    let project = source.is_dir()
+        || source
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("project.json"));
+    if !project && !["mp4", "m4v", "wmv", "webm", "mkv", "zip"].contains(&ext.as_str()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Выбери MP4, M4V или WMV.",
+            t(
+                "Выбери видео, ZIP или папку проекта Wallpaper Engine.",
+                "Choose a video, ZIP, or Wallpaper Engine project folder.",
+                "请选择视频、ZIP 或 Wallpaper Engine 项目文件夹。",
+            ),
         ));
     }
     let stamp = SystemTime::now()
@@ -142,16 +178,36 @@ pub fn import(source: &Path) -> io::Result<String> {
     fs::create_dir_all(root())?;
     fs::create_dir(&staging)?;
     let result = (|| {
-        let filename = format!("video.{ext}");
-        let title = source.file_stem().unwrap_or_default().to_string_lossy();
-        let video = staging.join(&filename);
-        fs::copy(source, &video)?;
-        if crate::video::Video::available(&video) {
-            crate::video::prepare_cache(&video, || false)?;
-        }
-        if let Some(pixels) = crate::video::thumbnail(&video) {
-            let _ = fs::write(staging.join("thumbnail.bgr"), pixels);
-        }
+        let (title, media) = if project {
+            crate::archive::unpack_project(source, &staging)?
+        } else if ext == "zip" {
+            crate::archive::unpack(source, &staging)?
+        } else {
+            let filename = format!("video.{ext}");
+            fs::copy(source, staging.join(&filename))?;
+            (None, crate::archive::Source::Video(filename))
+        };
+        let title = title.unwrap_or_else(|| {
+            source
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let filename = match media {
+            crate::archive::Source::Still => "image.bgr".into(),
+            crate::archive::Source::Video(filename) => {
+                let video = staging.join(&filename);
+                let quality = quality();
+                if crate::video::Video::available(&video, quality) {
+                    crate::video::prepare_cache(&video, quality, || false)?;
+                }
+                if let Some(pixels) = crate::video::thumbnail(&video) {
+                    fs::write(staging.join("thumbnail.bgr"), pixels)?;
+                }
+                filename
+            }
+        };
         fs::write(
             staging.join("entry.json"),
             serde_json::json!({ "Id": id, "Title": title, "VideoName": filename }).to_string(),
@@ -163,4 +219,31 @@ pub fn import(source: &Path) -> io::Result<String> {
         let _ = fs::remove_dir_all(staging);
     }
     result
+}
+
+pub fn is_still(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "bgr")
+}
+
+pub fn read_still(path: &Path) -> Option<crate::video::Frame> {
+    let length = fs::metadata(path).ok()?.len();
+    if !(20..=(3840 * 2160 * 3 + 8)).contains(&length) {
+        return None;
+    }
+    let mut bytes = fs::read(path).ok()?;
+    let width = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let height = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
+    if !(4..=3840).contains(&width)
+        || width % 4 != 0
+        || !(1..=2160).contains(&height)
+        || bytes.len() != 8 + width * height * 3
+    {
+        return None;
+    }
+    bytes.drain(..8);
+    Some(crate::video::Frame {
+        pixels: bytes,
+        width,
+        height,
+    })
 }

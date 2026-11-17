@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use crate::{data, video::Video, win::*};
 use std::{
     cell::RefCell,
@@ -29,7 +30,9 @@ struct Engine {
     paused: bool,
     animating: bool,
     active: String,
+    quality: crate::video::Quality,
     video: Option<Video>,
+    still: Option<crate::video::Frame>,
     tick: u32,
     taskbar_created: u32,
     size: (i32, i32),
@@ -114,24 +117,35 @@ unsafe fn open_library() {
 }
 
 unsafe fn tray_menu(hwnd: HWND) {
+    crate::i18n::set(data::language());
     let paused = ENGINE.with(|engine| engine.borrow().paused);
     let menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, 1, wide("Библиотека обоев").as_ptr());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        1,
+        wide(t("Библиотека обоев", "Wallpaper Library", "壁纸库")).as_ptr(),
+    );
     AppendMenuW(
         menu,
         MF_STRING | if paused { MF_CHECKED } else { 0 },
         2,
-        wide("Пауза").as_ptr(),
+        wide(t("Пауза", "Pause", "暂停")).as_ptr(),
     );
     let autostart = startup_enabled();
     AppendMenuW(
         menu,
         MF_STRING | if autostart { MF_CHECKED } else { 0 },
         4,
-        wide("Запускать с Windows").as_ptr(),
+        wide(t("Запускать с Windows", "Start with Windows", "开机启动")).as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, 3, wide("Выход").as_ptr());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        3,
+        wide(t("Выход", "Quit", "退出")).as_ptr(),
+    );
     let mut point = zeroed();
     GetCursorPos(&mut point);
     SetForegroundWindow(hwnd);
@@ -157,7 +171,14 @@ unsafe fn tray_menu(hwnd: HWND) {
         }
         4 => {
             if !set_startup(!autostart) {
-                message(hwnd, "Не удалось изменить автозапуск.");
+                message(
+                    hwnd,
+                    t(
+                        "Не удалось изменить автозапуск.",
+                        "Could not change startup settings.",
+                        "无法更改开机启动设置。",
+                    ),
+                );
             }
         }
         _ => {}
@@ -287,6 +308,7 @@ unsafe extern "system" fn controller(hwnd: HWND, message: u32, wp: WPARAM, lp: L
 unsafe fn refresh(owner: HWND) {
     let size = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
     let id = data::active();
+    let quality = data::quality();
     let covered = desktop_covered(size);
     let setup = ENGINE.with(|engine| {
         let state = engine.borrow();
@@ -311,9 +333,18 @@ unsafe fn refresh(owner: HWND) {
             resize = state.surface;
             state.size = size;
         }
-        if state.active != id {
-            state.video = data::video_for(&id).and_then(|path| Video::start(&path).ok());
-            if id != "winter" && state.video.is_none() {
+        if state.active != id || state.quality != quality {
+            state.quality = quality;
+            state.video = None;
+            state.still = None;
+            if let Some(path) = data::media_for(&id) {
+                if data::is_still(&path) {
+                    state.still = data::read_still(&path);
+                } else {
+                    state.video = Video::start(&path, quality).ok();
+                }
+            }
+            if id != "winter" && state.video.is_none() && state.still.is_none() {
                 fallback = true;
             }
             state.active = id;
@@ -324,8 +355,11 @@ unsafe fn refresh(owner: HWND) {
             invalidate = state.surface;
             fallback = true;
         }
-        let play =
-            !state.paused && !covered && !state.surface.is_null() && IsWindow(state.surface) != 0;
+        let play = !state.paused
+            && !covered
+            && state.still.is_none()
+            && !state.surface.is_null()
+            && IsWindow(state.surface) != 0;
         if let Some(video) = state.video.as_mut() {
             video.play(play);
         }
@@ -478,9 +512,11 @@ unsafe extern "system" fn wallpaper(hwnd: HWND, event: u32, wp: WPARAM, lp: LPAR
             let area = client(hwnd);
             ENGINE.with(|engine| {
                 if let Ok(state) = engine.try_borrow() {
-                    if let Some(video) = state.video.as_ref() {
+                    if let Some(frame) = state.still.as_ref() {
+                        bitmap_size(dc, area, &frame.pixels, frame.width, frame.height);
+                    } else if let Some(video) = state.video.as_ref() {
                         if let Some(frame) = video.frame.as_ref() {
-                            bitmap_size(dc, area, frame, crate::video::WIDTH, crate::video::HEIGHT);
+                            bitmap_size(dc, area, &frame.pixels, frame.width, frame.height);
                         } else {
                             bitmap(dc, area, WINTER);
                         }

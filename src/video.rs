@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -10,14 +11,39 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const WIDTH: usize = 960;
-pub const HEIGHT: usize = 540;
 pub const THUMB_WIDTH: usize = 320;
 pub const THUMB_HEIGHT: usize = 180;
 const STEP: Duration = Duration::from_millis(66);
-const MAX_JPEG: usize = 1_500_000;
-const FRAME_SIZE: usize = WIDTH * HEIGHT * 3;
-const CACHE_NAME: &str = "openengine-960x540-15.mjpeg";
+const MAX_JPEG: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Quality {
+    #[default]
+    Detail,
+    Low,
+}
+
+impl Quality {
+    fn cache(self) -> &'static str {
+        match self {
+            Self::Detail => "openengine-detail-v1.mjpeg",
+            Self::Low => "openengine-960x540-15.mjpeg",
+        }
+    }
+
+    fn filter(self) -> &'static str {
+        match self {
+            Self::Detail => "scale=w='min(iw,3840)':h='min(ih,2160)':force_original_aspect_ratio=decrease:force_divisible_by=4:flags=lanczos,setsar=1,fps=15",
+            Self::Low => "scale=960:540:force_original_aspect_ratio=increase:flags=lanczos,crop=960:540,setsar=1,fps=15",
+        }
+    }
+}
+
+pub struct Frame {
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
 const BOUNDARY: &[u8] = b"--openengine";
 type Shared = Arc<(Mutex<State>, Condvar)>;
 
@@ -25,13 +51,13 @@ struct State {
     playing: bool,
     cancelled: bool,
     failed: bool,
-    latest: Option<Vec<u8>>,
+    latest: Option<Frame>,
 }
 
 pub struct Video {
     worker: Option<JoinHandle<()>>,
     shared: Shared,
-    pub frame: Option<Vec<u8>>,
+    pub frame: Option<Frame>,
     playing: bool,
 }
 
@@ -67,12 +93,20 @@ pub fn thumbnail(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn ffmpeg(path: &Path) -> io::Result<Command> {
-    let executable = find_ffmpeg()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "FFmpeg отсутствует в PATH."))?;
-    let format = if path.extension().is_some_and(|ext| ext == "wmv") {
-        "asf"
-    } else {
-        "mov"
+    let executable = find_ffmpeg().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            t(
+                "FFmpeg отсутствует в PATH.",
+                "FFmpeg was not found on PATH.",
+                "PATH 中未找到 FFmpeg。",
+            ),
+        )
+    })?;
+    let format = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("wmv") => "asf",
+        Some("webm" | "mkv") => "matroska",
+        _ => "mov",
     };
     let mut command = Command::new(executable);
     command
@@ -97,22 +131,46 @@ fn ffmpeg(path: &Path) -> io::Result<Command> {
     Ok(command)
 }
 
-pub fn prepare_cache(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<PathBuf> {
-    let target = path.with_file_name(CACHE_NAME);
+pub fn prepare_cache(
+    path: &Path,
+    quality: Quality,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<PathBuf> {
+    let cache = quality.cache();
+    let target = path.with_file_name(cache);
     if target.is_file() {
         return Ok(target);
     }
-    let temp = path.with_file_name(format!("{CACHE_NAME}.{}.tmp", std::process::id()));
+    let temp = path.with_file_name(format!("{cache}.{}.tmp", std::process::id()));
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)?;
     let result = (|| {
-        let mut child = ffmpeg(path)?.args([
-            "-vf", "scale=960:540:force_original_aspect_ratio=increase:flags=lanczos,crop=960:540,setsar=1,fps=15",
-            "-threads", "1", "-c:v", "mjpeg", "-q:v", "8", "-pix_fmt", "yuvj420p",
-            "-f", "mpjpeg", "-boundary_tag", "openengine", "pipe:1",
-        ]).stdout(Stdio::from(file)).spawn()?;
+        let mut child = ffmpeg(path)?
+            .args([
+                "-vf",
+                quality.filter(),
+                "-threads",
+                "1",
+                "-c:v",
+                "mjpeg",
+                "-q:v",
+                if quality == Quality::Detail { "2" } else { "8" },
+                "-pix_fmt",
+                if quality == Quality::Detail {
+                    "yuvj444p"
+                } else {
+                    "yuvj420p"
+                },
+                "-f",
+                "mpjpeg",
+                "-boundary_tag",
+                "openengine",
+                "pipe:1",
+            ])
+            .stdout(Stdio::from(file))
+            .spawn()?;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -122,7 +180,11 @@ pub fn prepare_cache(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<Pa
                 let _ = child.wait();
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "Подготовка видео отменена.",
+                    t(
+                        "Подготовка видео отменена.",
+                        "Video preparation cancelled.",
+                        "视频准备已取消。",
+                    ),
                 ));
             }
             thread::sleep(Duration::from_millis(70));
@@ -130,7 +192,11 @@ pub fn prepare_cache(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<Pa
         if !status.success() || fs::metadata(&temp)?.len() < 100 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Не удалось подготовить видео. Попробуй MP4 с H.264.",
+                t(
+                    "Не удалось подготовить видео. Попробуй MP4 с H.264.",
+                    "Could not prepare video. Try an H.264 MP4.",
+                    "无法准备视频，请尝试 H.264 编码的 MP4。",
+                ),
             ));
         }
         match fs::rename(&temp, &target) {
@@ -144,11 +210,11 @@ pub fn prepare_cache(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<Pa
 }
 
 impl Video {
-    pub fn available(path: &Path) -> bool {
-        path.with_file_name(CACHE_NAME).is_file() || find_ffmpeg().is_some()
+    pub fn available(path: &Path, quality: Quality) -> bool {
+        path.with_file_name(quality.cache()).is_file() || find_ffmpeg().is_some()
     }
 
-    pub fn start(path: &Path) -> io::Result<Self> {
+    pub fn start(path: &Path, quality: Quality) -> io::Result<Self> {
         let shared = Arc::new((
             Mutex::new(State {
                 playing: false,
@@ -163,7 +229,7 @@ impl Video {
         let worker = thread::Builder::new()
             .name("video-frames".into())
             .spawn(move || {
-                if render_loop(&path, &state).is_err() {
+                if render_loop(&path, quality, &state).is_err() {
                     state.0.lock().unwrap().failed = true;
                 }
             })?;
@@ -198,9 +264,9 @@ impl Video {
     }
 }
 
-fn render_loop(source: &Path, shared: &Shared) -> io::Result<()> {
+fn render_loop(source: &Path, quality: Quality, shared: &Shared) -> io::Result<()> {
     let (lock, wake) = &**shared;
-    let cache = prepare_cache(source, || lock.lock().unwrap().cancelled)?;
+    let cache = prepare_cache(source, quality, || lock.lock().unwrap().cancelled)?;
     let mut input = BufReader::new(File::open(cache)?);
     let mut jpeg = Vec::new();
     loop {
@@ -221,21 +287,29 @@ fn render_loop(source: &Path, shared: &Shared) -> io::Result<()> {
         let mut decoder = jpeg_decoder::Decoder::new(jpeg.as_slice());
         decoder.read_info().map_err(|_| invalid())?;
         let info = decoder.info().ok_or_else(invalid)?;
-        if usize::from(info.width) != WIDTH
-            || usize::from(info.height) != HEIGHT
+        let (width, height) = (usize::from(info.width), usize::from(info.height));
+        if width == 0
+            || width > 3840
+            || width % 4 != 0
+            || height == 0
+            || height > 2160
             || info.pixel_format != jpeg_decoder::PixelFormat::RGB24
         {
             return Err(invalid());
         }
         let mut pixels = decoder.decode().map_err(|_| invalid())?;
-        if pixels.len() != FRAME_SIZE {
+        if pixels.len() != width * height * 3 {
             return Err(invalid());
         }
         for pixel in pixels.chunks_exact_mut(3) {
             pixel.swap(0, 2);
         }
         let mut state = lock.lock().unwrap();
-        state.latest = Some(pixels);
+        state.latest = Some(Frame {
+            pixels,
+            width,
+            height,
+        });
         let _ = wake
             .wait_timeout_while(state, STEP.saturating_sub(now.elapsed()), |s| {
                 s.playing && !s.cancelled
@@ -247,7 +321,11 @@ fn render_loop(source: &Path, shared: &Shared) -> io::Result<()> {
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        "Повреждён кеш видео OpenEngine.",
+        t(
+            "Повреждён кеш видео OpenEngine.",
+            "The OpenEngine video cache is damaged.",
+            "OpenEngine 视频缓存已损坏。",
+        ),
     )
 }
 

@@ -4,12 +4,12 @@
 
 适用于 Windows 11 的动态壁纸工具。你可以选用内置的「冬夜」场景，也可以导入自己的视频。壁纸显示在桌面图标后方，关闭壁纸库窗口后仍会继续播放。
 
-![使用「霜糖棉花糖」主题的 OpenEngine 壁纸库](docs/library.png)
+![使用白色主题的 OpenEngine 壁纸库](docs/library.png)
 
 ## 快速开始
 
 1. 从 [Releases 下载 OpenEngine.exe](../../releases/latest) 并运行。内置场景开箱即用。
-2. 要使用自己的视频，点击 **导入视频**，选择 MP4、M4V 或 WMV 文件，再选中对应卡片并点击 **设为桌面壁纸**。当前软件界面为俄语。
+2. 要使用自己的视频，点击 **添加**，选择 MP4、M4V 或 WMV 文件，再选中对应卡片并点击 **设为桌面壁纸**。
 3. 右键点击通知区域中的 OpenEngine 图标，可打开壁纸库、暂停播放、设置开机启动或退出。退出后，Windows 会重新显示原来的桌面背景。
 
 导入视频前，请安装 [FFmpeg](https://ffmpeg.org/download.html)，确认它已加入 PATH，然后重新打开 OpenEngine。
@@ -20,9 +20,15 @@ winget install --id Gyan.FFmpeg --exact
 
 OpenEngine 会复制导入的视频并生成帧缓存，因此壁纸库的磁盘占用会大于原始视频。FFmpeg 只在准备缓存时运行。播放时由 Rust 引擎读取本地缓存，视频静音循环。设置和壁纸保存在 `%LOCALAPPDATA%\OpenEngine\Library`。
 
-## 界面主题
+## 从 Wallpaper Engine 导入
 
-「霜糖棉花糖」以浅蓝、白色和粉色为主。「蜜桃软毯」采用温暖的珊瑚色调，「薄荷茶」则以浅绿色为主。主题应用于壁纸库窗口。卡片、缩略图和选中壁纸的预览面板参考了 [Lively Wallpaper 的壁纸库](https://github.com/lively-community/lively/wiki/Getting-Started)。
+把视频、ZIP 压缩包或 Wallpaper Engine 项目文件夹拖入壁纸库，也可以点击「添加」选择 `project.json`。OpenEngine 会导入项目指定的视频。支持 MP4、M4V、WMV、WebM 和 MKV。
+
+对于支持的 PKGV0018 格式 `scene.pkg` 项目，OpenEngine 可提取支持范围内最大的 PNG 纹理，设为静态壁纸。场景着色器、粒子和动画需要 Wallpaper Engine。
+
+## 界面与语言
+
+在设置中可以选择白色或深色主题，并切换俄语、英语及简体中文。卡片和壁纸预览面板参考了 [Lively Wallpaper](https://github.com/lively-community/lively/wiki/Getting-Started)。
 
 ## Rust、多线程和内存优化
 
@@ -34,7 +40,7 @@ OpenEngine 使用 Rust 开发，通过 Win32/GDI 绘制。引擎负责桌面壁�
 
 在 Windows 11 x64（内部版本 26200）、2560×1440 分辨率下测试，导入一段短 H.264 MP4 后，在打开壁纸库并循环播放的情况下，OpenEngine 进程的**私有工作集总计约为 8.9 MiB**，取自 `WorkingSetPrivate` 计数器。包含共享内存页的完整工作集会更高。文件选择对话框和视频预处理会暂时增加内存占用，实际结果取决于视频和系统。
 
-内置场景分辨率为 1600×900。导入视频会转换为 960×540、15 帧/秒，显示时采用平滑缩放。当前版本在主显示器上显示壁纸。
+内置冬夜场景以 3840×2160 渲染。高清模式保留最高 3840×2160 的源视频分辨率（尺寸按解码要求对齐），以每秒 15 帧播放。可在设置中切换到 540p 以节省内存和磁盘空间。上文的内存测试适用于 540p。壁纸显示在主显示器上。
 
 ## 从源码构建
 
@@ -52,6 +58,10 @@ rustup target add x86_64-pc-windows-gnullvm
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = "x86_64-w64-mingw32-clang.exe"
 cargo build --locked --release --target x86_64-pc-windows-gnullvm
 ```
+
+## 发布
+
+推送形如 `v0.4.0` 的标签会触发 GitHub Actions 的 Windows 构建，并自动将 `OpenEngine.exe` 和源代码压缩包附加到发布页面。
 
 ## 许可证
 

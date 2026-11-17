@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use crate::{
     data::{self, Entry},
     video::Video,
@@ -15,11 +16,12 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::*,
-    Graphics::Gdi::*,
+    Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*},
     System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
         Controls::{Dialogs::*, DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
         Input::KeyboardAndMouse::EnableWindow,
+        Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP},
         WindowsAndMessaging::*,
     },
 };
@@ -30,8 +32,14 @@ const IMPORT: usize = 102;
 const APPLY: usize = 103;
 const THEME: usize = 104;
 const IMPORT_DONE: u32 = WM_APP + 3;
-const CARD_W: i32 = 180;
-const CARD_H: i32 = 156;
+const SEARCH: usize = 105;
+const GALLERY: usize = 106;
+const SETTINGS: usize = 107;
+const QUALITY: usize = 108;
+const FILTER: usize = 109;
+const LANGUAGE: usize = 112;
+const CARD_W: i32 = 208;
+const CARD_H: i32 = 174;
 
 struct Palette {
     canvas: COLORREF,
@@ -41,36 +49,33 @@ struct Palette {
     muted: COLORREF,
     accent: COLORREF,
 }
-const THEMES: [Palette; 3] = [
+const THEMES: [Palette; 2] = [
     Palette {
-        canvas: rgb(235, 246, 255),
+        canvas: rgb(243, 247, 253),
         panel: rgb(255, 255, 255),
-        card: rgb(218, 234, 249),
-        text: rgb(35, 55, 81),
-        muted: rgb(77, 104, 132),
+        card: rgb(218, 234, 252),
+        text: rgb(29, 48, 72),
+        muted: rgb(73, 96, 123),
         accent: rgb(245, 199, 224),
     },
     Palette {
-        canvas: rgb(255, 241, 233),
-        panel: rgb(255, 252, 249),
-        card: rgb(251, 228, 216),
-        text: rgb(80, 47, 57),
-        muted: rgb(125, 84, 88),
-        accent: rgb(255, 189, 176),
-    },
-    Palette {
-        canvas: rgb(232, 246, 240),
-        panel: rgb(251, 255, 253),
-        card: rgb(219, 239, 229),
-        text: rgb(37, 63, 58),
-        muted: rgb(75, 112, 99),
-        accent: rgb(238, 205, 217),
+        canvas: rgb(16, 22, 32),
+        panel: rgb(24, 33, 47),
+        card: rgb(41, 57, 80),
+        text: rgb(236, 242, 250),
+        muted: rgb(170, 190, 215),
+        accent: rgb(87, 66, 100),
     },
 ];
-const TITLES: [&str; 3] = ["Морозный зефир", "Персиковый плед", "Мятный чай"];
+const LANGUAGES: [&str; 3] = ["Русский", "English", "简体中文"];
 
 thread_local! { static UI: RefCell<Option<Library>> = const { RefCell::new(None) }; }
-static RESULT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
+struct ImportResult {
+    last_id: Option<String>,
+    added: usize,
+    problems: Vec<String>,
+}
+static RESULT: Mutex<Option<ImportResult>> = Mutex::new(None);
 
 struct Library {
     entries: Vec<Entry>,
@@ -83,10 +88,19 @@ struct Library {
     import: HWND,
     apply: HWND,
     combo: HWND,
+    language: HWND,
     body: HFONT,
     title: HFONT,
     display: HFONT,
     brush: HBRUSH,
+    search: HWND,
+    gallery: HWND,
+    settings: HWND,
+    quality: HWND,
+    preferences: bool,
+    query: String,
+    filter: usize,
+    filters: [HWND; 3],
 }
 
 impl Drop for Library {
@@ -115,8 +129,8 @@ pub unsafe fn run() {
         return;
     }
     register(CLASS, Some(procedure));
-    let width = 1030;
-    let height = 690;
+    let width = 1296;
+    let height = 824;
     let screen_w = GetSystemMetrics(SM_CXSCREEN);
     let screen_h = GetSystemMetrics(SM_CYSCREEN);
     let hwnd = CreateWindowExW(
@@ -137,7 +151,13 @@ pub unsafe fn run() {
         init(hwnd);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
-        loop_messages();
+        let mut msg: MSG = zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
         UI.with(|state| state.borrow_mut().take());
     }
     CloseHandle(mutex);
@@ -197,24 +217,71 @@ unsafe fn init(hwnd: HWND) {
         hwnd,
         IMPORT,
         "BUTTON",
-        "+  Импорт видео",
+        t("+  Добавить", "+  Add", "+  添加"),
         BS_OWNERDRAW as u32,
     );
     let apply = control(
         hwnd,
         APPLY,
         "BUTTON",
-        "На рабочий стол",
+        t("На рабочий стол", "Set wallpaper", "设为壁纸"),
         BS_OWNERDRAW as u32,
     );
     let combo = control(hwnd, THEME, "COMBOBOX", "", CBS_DROPDOWNLIST as u32);
+    let language = control(hwnd, LANGUAGE, "COMBOBOX", "", CBS_DROPDOWNLIST as u32);
+    for label in LANGUAGES {
+        SendMessageW(language, CB_ADDSTRING, 0, wide(label).as_ptr() as LPARAM);
+    }
+    SendMessageW(language, CB_SETCURSEL, data::language(), 0);
+    let gallery = control(
+        hwnd,
+        GALLERY,
+        "BUTTON",
+        t("Библиотека", "Library", "壁纸库"),
+        BS_OWNERDRAW as u32,
+    );
+    let settings = control(
+        hwnd,
+        SETTINGS,
+        "BUTTON",
+        t("Настройки", "Settings", "设置"),
+        BS_OWNERDRAW as u32,
+    );
+    let search = control(hwnd, SEARCH, "EDIT", "", WS_BORDER | ES_AUTOHSCROLL as u32);
+    let quality = control(hwnd, QUALITY, "COMBOBOX", "", CBS_DROPDOWNLIST as u32);
+    SendMessageW(
+        search,
+        0x1501,
+        0,
+        wide(t("Поиск по названию", "Search by name", "按名称搜索")).as_ptr() as LPARAM,
+    );
+    for label in [
+        t("Детальное · до 4K", "Detail · Up to 4K", "高清 · 最高 4K"),
+        t("Экономичное · 540p", "Low memory · 540p", "节省内存 · 540p"),
+    ] {
+        SendMessageW(quality, CB_ADDSTRING, 0, wide(label).as_ptr() as LPARAM);
+    }
+    SendMessageW(
+        quality,
+        CB_SETCURSEL,
+        usize::from(data::quality() == crate::video::Quality::Low),
+        0,
+    );
+    let filters = std::array::from_fn(|index| {
+        control(hwnd, FILTER + index, "BUTTON", "", BS_OWNERDRAW as u32)
+    });
     let body = make_font(16, 400);
-    for control in [list, import, apply, combo] {
+    for control in [
+        list, import, apply, combo, search, gallery, settings, quality,
+    ] {
         SendMessageW(control, WM_SETFONT, body as usize, 0);
+    }
+    for filter in filters {
+        SendMessageW(filter, WM_SETFONT, body as usize, 0);
     }
     SendMessageW(list, LB_SETITEMHEIGHT, 0, CARD_H as LPARAM);
     SendMessageW(list, LB_SETCOLUMNWIDTH, CARD_W as usize, 0);
-    for name in TITLES {
+    for name in [t("Белая", "White", "白色"), t("Тёмная", "Dark", "深色")] {
         SendMessageW(combo, CB_ADDSTRING, 0, wide(name).as_ptr() as LPARAM);
     }
     SendMessageW(combo, CB_SETCURSEL, theme, 0);
@@ -230,15 +297,81 @@ unsafe fn init(hwnd: HWND) {
             import,
             apply,
             combo,
+            language,
             body,
             title: make_font(21, 600),
             display: make_font(32, 650),
-            brush: CreateSolidBrush(THEMES[theme].panel),
+            brush: CreateSolidBrush(THEMES[theme].canvas),
+            search,
+            gallery,
+            settings,
+            quality,
+            preferences: false,
+            query: String::new(),
+            filter: 0,
+            filters,
         })
     });
-    reload(hwnd, None);
+    set_title_theme(hwnd, theme);
+    update_language(hwnd);
     layout(hwnd);
+    DragAcceptFiles(hwnd, 1);
     SetTimer(hwnd, 1, 1000, None);
+}
+
+unsafe fn set_title_theme(hwnd: HWND, theme: usize) {
+    let dark = i32::from(theme == 1);
+    DwmSetWindowAttribute(
+        hwnd,
+        20,
+        (&dark as *const i32).cast(),
+        size_of::<i32>() as u32,
+    );
+}
+
+unsafe fn update_language(hwnd: HWND) {
+    let captions = [
+        (IMPORT, t("+  Добавить", "+  Add", "+  添加")),
+        (GALLERY, t("Библиотека", "Library", "壁纸库")),
+        (SETTINGS, t("Настройки", "Settings", "设置")),
+        (FILTER, t("Все обои", "All", "全部")),
+        (FILTER + 1, t("Сцены", "Scenes", "场景")),
+        (FILTER + 2, t("Видео", "Videos", "视频")),
+    ];
+    for (id, label) in captions {
+        let control = GetDlgItem(hwnd, id as i32);
+        SetWindowTextW(control, wide(label).as_ptr());
+        InvalidateRect(control, null(), 0);
+    }
+    let theme = GetDlgItem(hwnd, THEME as i32);
+    let quality = GetDlgItem(hwnd, QUALITY as i32);
+    for (control, labels, index) in [
+        (
+            theme,
+            [t("Белая", "White", "白色"), t("Тёмная", "Dark", "深色")],
+            data::theme(),
+        ),
+        (
+            quality,
+            [
+                t("Детальное · до 4K", "Detail · Up to 4K", "高清 · 最高 4K"),
+                t("Экономичное · 540p", "Low memory · 540p", "节省内存 · 540p"),
+            ],
+            usize::from(data::quality() == crate::video::Quality::Low),
+        ),
+    ] {
+        SendMessageW(control, CB_RESETCONTENT, 0, 0);
+        for label in labels {
+            SendMessageW(control, CB_ADDSTRING, 0, wide(label).as_ptr() as LPARAM);
+        }
+        SendMessageW(control, CB_SETCURSEL, index, 0);
+    }
+    UI.with(|state| {
+        if let Some(ui) = state.borrow_mut().as_mut() {
+            ui.status.clear();
+        }
+    });
+    reload(hwnd, None);
 }
 
 unsafe fn reload(hwnd: HWND, select: Option<&str>) {
@@ -249,7 +382,20 @@ unsafe fn reload(hwnd: HWND, select: Option<&str>) {
         let Some(ui) = window.as_mut() else {
             return (null_mut(), vec![], 0);
         };
-        ui.entries = entries;
+        ui.entries = entries
+            .into_iter()
+            .filter(|item| {
+                item.title.to_lowercase().contains(&ui.query)
+                    && match ui.filter {
+                        1 => item.path.as_deref().is_none_or(data::is_still),
+                        2 => item
+                            .path
+                            .as_deref()
+                            .is_some_and(|path| !data::is_still(path)),
+                        _ => true,
+                    }
+            })
+            .collect();
         ui.active = active;
         ui.selected = ui
             .entries
@@ -277,42 +423,110 @@ unsafe fn reload(hwnd: HWND, select: Option<&str>) {
     update_controls(hwnd);
 }
 
+struct Layout {
+    x: i32,
+    inspector: i32,
+    width: i32,
+    height: i32,
+}
+
+impl Layout {
+    fn new(area: RECT) -> Self {
+        let width = area.right;
+        Self {
+            x: 226,
+            inspector: width - (width * 31 / 100).max(301),
+            width,
+            height: area.bottom,
+        }
+    }
+}
+
 unsafe fn layout(hwnd: HWND) {
-    let area = client(hwnd);
-    let Some((list, import, apply, combo, count)) = UI.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .map(|ui| (ui.list, ui.import, ui.apply, ui.combo, ui.entries.len()))
-    }) else {
+    let l = Layout::new(client(hwnd));
+    let Some((
+        list,
+        import,
+        apply,
+        combo,
+        search,
+        gallery,
+        settings,
+        quality,
+        preferences,
+        filters,
+        count,
+        language,
+    )) = UI.with(|state| {
+        state.borrow().as_ref().map(|ui| {
+            (
+                ui.list,
+                ui.import,
+                ui.apply,
+                ui.combo,
+                ui.search,
+                ui.gallery,
+                ui.settings,
+                ui.quality,
+                ui.preferences,
+                ui.filters,
+                ui.entries.len(),
+                ui.language,
+            )
+        })
+    })
+    else {
         return;
     };
-    let height = area.bottom;
-    let width = area.right;
-    let left_width = ((width - 64) * 59 / 100).max(380);
-    let right_x = 40 + left_width;
+    MoveWindow(gallery, 22, 108, 160, 44, 1);
+    MoveWindow(settings, 22, 158, 160, 44, 1);
+    MoveWindow(import, l.width - 172, 32, 146, 42, 1);
+    MoveWindow(
+        search,
+        l.x + 65,
+        116,
+        (l.inspector - l.x - 95).min(330),
+        30,
+        1,
+    );
     MoveWindow(
         list,
-        34,
-        136,
-        left_width - 20,
-        if count <= 3 {
-            CARD_H + 20
+        l.x,
+        209,
+        l.inspector - l.x - 20,
+        if count <= ((l.inspector - l.x - 20) / CARD_W).max(1) as usize {
+            CARD_H + 18
         } else {
-            (height - 258).max(166)
+            (l.height - 270).max(190)
         },
         1,
     );
-    MoveWindow(import, 24 + left_width - 161, 87, 147, 33, 1);
     MoveWindow(
         apply,
-        right_x + 16,
-        height - 174,
-        width - right_x - 54,
-        38,
+        l.inspector + 18,
+        l.height - 104,
+        l.width - l.inspector - 63,
+        44,
         1,
     );
-    MoveWindow(combo, width - 258, height - 80, 207, 175, 1);
+    let half = (l.width - l.x - 45) / 2;
+    MoveWindow(combo, l.x + 24, 198, half.min(255), 180, 1);
+    MoveWindow(language, l.x + half + 23, 198, half.min(255), 180, 1);
+    MoveWindow(quality, l.x + 24, 371, 255, 180, 1);
+    for (index, filter) in filters.into_iter().enumerate() {
+        MoveWindow(filter, l.x + 107 * index as i32, 160, 99, 34, 1);
+        ShowWindow(filter, if preferences { SW_HIDE } else { SW_SHOW });
+        InvalidateRect(filter, null(), 0);
+    }
+    for control in [list, import, apply, search] {
+        ShowWindow(control, if preferences { SW_HIDE } else { SW_SHOW });
+    }
+    for control in [combo, quality, language] {
+        ShowWindow(control, if preferences { SW_SHOW } else { SW_HIDE });
+    }
+    for control in [gallery, settings] {
+        InvalidateRect(control, null(), 1);
+    }
     InvalidateRect(hwnd, null(), 0);
 }
 
@@ -324,7 +538,11 @@ unsafe fn update_controls(hwnd: HWND) {
                 .entries
                 .get(ui.selected)
                 .is_some_and(|item| item.id == ui.active);
-            (ui.apply, !active && !ui.busy, active)
+            (
+                ui.apply,
+                !active && !ui.busy && !ui.entries.is_empty(),
+                active,
+            )
         })
     }) else {
         return;
@@ -332,9 +550,9 @@ unsafe fn update_controls(hwnd: HWND) {
     SetWindowTextW(
         apply,
         wide(if active {
-            "Установлено"
+            t("Установлено", "Applied", "已应用")
         } else {
-            "На рабочий стол"
+            t("На рабочий стол", "Set wallpaper", "设为壁纸")
         })
         .as_ptr(),
     );
@@ -357,11 +575,15 @@ unsafe fn apply_selected(hwnd: HWND) {
     if item
         .path
         .as_deref()
-        .is_some_and(|path| !Video::available(path))
+        .is_some_and(|path| !data::is_still(path) && !Video::available(path, data::quality()))
     {
         message(
             hwnd,
-            "Для видео нужен FFmpeg в PATH. Установи его и перезапусти OpenEngine.",
+            t(
+                "Для видео нужен FFmpeg в PATH. Установи его и перезапусти OpenEngine.",
+                "Install FFmpeg, add it to PATH, and restart OpenEngine.",
+                "请安装 FFmpeg，将其加入 PATH，然后重新启动 OpenEngine。",
+            ),
         );
         return;
     }
@@ -373,7 +595,7 @@ unsafe fn apply_selected(hwnd: HWND) {
         let mut state = state.borrow_mut();
         let ui = state.as_mut().unwrap();
         ui.active = item.id;
-        ui.status = "Обои установлены.".into();
+        ui.status = t("Обои установлены.", "Wallpaper applied.", "已应用壁纸。").into();
         InvalidateRect(ui.list, null(), 0);
     });
     update_controls(hwnd);
@@ -383,7 +605,14 @@ unsafe fn pick_video(hwnd: HWND) {
     if UI.with(|state| state.borrow().as_ref().is_some_and(|ui| ui.busy)) {
         return;
     }
-    let filter = wide("Видео MP4, M4V, WMV\0*.mp4;*.m4v;*.wmv\0");
+    let filter = wide(&format!(
+        "{}\0*.mp4;*.m4v;*.wmv;*.webm;*.mkv;*.zip;project.json\0",
+        t(
+            "Видео, ZIP и проекты",
+            "Videos, ZIP and projects",
+            "视频、ZIP 与项目"
+        )
+    ));
     let mut file = vec![0u16; 32768];
     let mut dialog: OPENFILENAMEW = zeroed();
     dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
@@ -397,48 +626,137 @@ unsafe fn pick_video(hwnd: HWND) {
     }
     let length = file.iter().position(|&x| x == 0).unwrap_or(file.len());
     let source = PathBuf::from(OsString::from_wide(&file[..length]));
+    start_import(hwnd, vec![source]);
+}
+
+unsafe fn drop_files(hwnd: HWND, drop: HDROP) {
+    let count = DragQueryFileW(drop, u32::MAX, null_mut(), 0);
+    let mut paths = Vec::new();
+    for index in 0..count {
+        let length = DragQueryFileW(drop, index, null_mut(), 0);
+        if length == 0 {
+            continue;
+        }
+        let mut path = vec![0; length as usize + 1];
+        let n = DragQueryFileW(drop, index, path.as_mut_ptr(), path.len() as u32);
+        if n > 0 {
+            paths.push(PathBuf::from(OsString::from_wide(&path[..n as usize])));
+        }
+    }
+    DragFinish(drop);
+    start_import(hwnd, paths);
+}
+
+unsafe fn start_import(hwnd: HWND, sources: Vec<PathBuf>) {
+    if sources.is_empty() {
+        return;
+    }
     let import = UI.with(|state| {
         let mut state = state.borrow_mut();
-        let ui = state.as_mut().unwrap();
+        let Some(ui) = state.as_mut() else {
+            return null_mut();
+        };
+        if ui.busy {
+            ui.status = t(
+                "Дождись окончания текущего импорта.",
+                "Wait for the current import to finish.",
+                "请等待当前导入完成。",
+            )
+            .into();
+            return null_mut();
+        }
         ui.busy = true;
-        ui.status = "Копирую видео…".into();
+        ui.status = t(
+            "Подготавливаю обои…",
+            "Preparing wallpapers…",
+            "正在准备壁纸…",
+        )
+        .into();
         ui.import
     });
+    if import.is_null() {
+        InvalidateRect(hwnd, null(), 0);
+        return;
+    }
     EnableWindow(import, 0);
     update_controls(hwnd);
     let window = hwnd as usize;
     thread::spawn(move || {
-        *RESULT.lock().unwrap() = Some(data::import(&source).map_err(|error| error.to_string()));
+        let mut result = ImportResult {
+            last_id: None,
+            added: 0,
+            problems: Vec::new(),
+        };
+        for path in sources {
+            match data::import(&path) {
+                Ok(id) => {
+                    result.last_id = Some(id);
+                    result.added += 1;
+                }
+                Err(error) => result.problems.push(format!(
+                    "{}: {error}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                )),
+            }
+        }
+        *RESULT.lock().unwrap() = Some(result);
         PostMessageW(window as HWND, IMPORT_DONE, 0, 0);
     });
 }
 
 unsafe fn import_done(hwnd: HWND) {
-    let result = RESULT.lock().unwrap().take();
-    let Some(result) = result else { return };
-    let import = UI.with(|state| {
+    let Some(result) = RESULT.lock().unwrap().take() else {
+        return;
+    };
+    let (import, search) = UI.with(|state| {
         let mut state = state.borrow_mut();
         let ui = state.as_mut().unwrap();
         ui.busy = false;
-        ui.status = match &result {
-            Ok(_) => "Видео добавлено в библиотеку.".into(),
-            Err(error) => error.clone(),
+        ui.status = if result.added > 0 {
+            format!(
+                "{}: {}",
+                t(
+                    "Добавлено в библиотеку",
+                    "Added to library",
+                    "已添加到壁纸库"
+                ),
+                result.added
+            )
+        } else {
+            t(
+                "Не удалось добавить обои.",
+                "Could not import wallpapers.",
+                "无法导入壁纸。",
+            )
+            .into()
         };
-        ui.import
+        if result.last_id.is_some() {
+            ui.preferences = false;
+            ui.filter = 0;
+            ui.query.clear();
+        }
+        (ui.import, ui.search)
     });
     EnableWindow(import, 1);
-    match result {
-        Ok(id) => reload(hwnd, Some(&id)),
-        Err(error) => message(hwnd, &error),
+    if let Some(id) = result.last_id {
+        SetWindowTextW(search, wide("").as_ptr());
+        reload(hwnd, Some(&id));
+    }
+    if !result.problems.is_empty() {
+        message(hwnd, &result.problems.join("\n"));
     }
     update_controls(hwnd);
 }
 
 unsafe extern "system" fn procedure(hwnd: HWND, event: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match event {
+        WM_DROPFILES => {
+            drop_files(hwnd, wp as HDROP);
+            0
+        }
         WM_GETMINMAXINFO => {
             let info = &mut *(lp as *mut MINMAXINFO);
-            info.ptMinTrackSize = POINT { x: 835, y: 570 };
+            info.ptMinTrackSize = POINT { x: 960, y: 660 };
             0
         }
         WM_SIZE => {
@@ -457,9 +775,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, event: u32, wp: WPARAM, lp: LPAR
             EndPaint(hwnd, &paint);
             0
         }
-        WM_CTLCOLORLISTBOX => UI.with(|state| {
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => UI.with(|state| {
             state.borrow().as_ref().map_or(0, |ui| {
-                SetBkColor(wp as HDC, THEMES[ui.theme].panel);
+                SetBkColor(wp as HDC, THEMES[ui.theme].canvas);
                 SetTextColor(wp as HDC, THEMES[ui.theme].text);
                 ui.brush as LRESULT
             })
@@ -495,6 +813,54 @@ unsafe extern "system" fn procedure(hwnd: HWND, event: u32, wp: WPARAM, lp: LPAR
                 }
                 APPLY if code == BN_CLICKED => apply_selected(hwnd),
                 IMPORT if code == BN_CLICKED => pick_video(hwnd),
+                GALLERY | SETTINGS if code == BN_CLICKED => {
+                    UI.with(|state| {
+                        if let Some(ui) = state.borrow_mut().as_mut() {
+                            ui.preferences = id == SETTINGS;
+                        }
+                    });
+                    layout(hwnd);
+                }
+                SEARCH if code == EN_CHANGE as u32 => {
+                    let mut buffer = vec![0; GetWindowTextLengthW(lp as HWND).max(0) as usize + 1];
+                    let n = GetWindowTextW(lp as HWND, buffer.as_mut_ptr(), buffer.len() as i32)
+                        .max(0) as usize;
+                    let query = String::from_utf16_lossy(&buffer[..n]).trim().to_lowercase();
+                    UI.with(|state| {
+                        if let Some(ui) = state.borrow_mut().as_mut() {
+                            ui.query = query;
+                        }
+                    });
+                    reload(hwnd, None);
+                }
+                id if (FILTER..FILTER + 3).contains(&id) && code == BN_CLICKED => {
+                    UI.with(|state| {
+                        if let Some(ui) = state.borrow_mut().as_mut() {
+                            ui.filter = id - FILTER;
+                        }
+                    });
+                    reload(hwnd, None);
+                }
+                QUALITY if code == CBN_SELCHANGE as u32 => {
+                    let index = SendMessageW(lp as HWND, CB_GETCURSEL, 0, 0);
+                    if index >= 0 {
+                        if let Err(error) = data::save_quality(index == 1) {
+                            message(hwnd, &error.to_string());
+                        }
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+                LANGUAGE if code == CBN_SELCHANGE as u32 => {
+                    let index = SendMessageW(lp as HWND, CB_GETCURSEL, 0, 0);
+                    if (0..3).contains(&index) {
+                        if let Err(error) = data::save_language(index as usize) {
+                            message(hwnd, &error.to_string());
+                        } else {
+                            crate::i18n::set(index as usize);
+                            update_language(hwnd);
+                        }
+                    }
+                }
                 THEME if code == CBN_SELCHANGE as u32 => {
                     let index = SendMessageW(lp as HWND, CB_GETCURSEL, 0, 0);
                     if index >= 0 && (index as usize) < THEMES.len() {
@@ -502,12 +868,20 @@ unsafe extern "system" fn procedure(hwnd: HWND, event: u32, wp: WPARAM, lp: LPAR
                         if let Err(error) = data::save_theme(index) {
                             message(hwnd, &error.to_string());
                         }
+                        set_title_theme(hwnd, index);
                         UI.with(|state| {
                             if let Some(ui) = state.borrow_mut().as_mut() {
                                 ui.theme = index;
                                 DeleteObject(ui.brush);
-                                ui.brush = CreateSolidBrush(THEMES[index].panel);
-                                for control in [ui.list, ui.apply, ui.import] {
+                                ui.brush = CreateSolidBrush(THEMES[index].canvas);
+                                for control in [
+                                    ui.list,
+                                    ui.apply,
+                                    ui.import,
+                                    ui.search,
+                                    ui.gallery,
+                                    ui.settings,
+                                ] {
                                     InvalidateRect(control, null(), 1);
                                 }
                             }
@@ -578,86 +952,228 @@ unsafe fn text(
     SelectObject(dc, old);
 }
 
+unsafe fn rounded(dc: HDC, a: RECT, color: COLORREF, radius: i32) {
+    let pen = SelectObject(dc, GetStockObject(NULL_PEN));
+    let brush = CreateSolidBrush(color);
+    let old = SelectObject(dc, brush);
+    RoundRect(dc, a.left, a.top, a.right, a.bottom, radius, radius);
+    SelectObject(dc, old);
+    SelectObject(dc, pen);
+    DeleteObject(brush);
+}
+
 unsafe fn paint_ui(dc: HDC, area: RECT, ui: &Library) {
     let p = &THEMES[ui.theme];
-    let width = area.right;
-    let height = area.bottom;
+    let l = Layout::new(area);
     fill(dc, area, p.canvas);
-    text(
+    fill(dc, rect(0, 0, 204, l.height), p.panel);
+    rounded(dc, rect(22, 28, 32, 32), p.accent, 10);
+    let mark = CreateSolidBrush(p.text);
+    let previous = SelectObject(dc, mark);
+    let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+    Polygon(
         dc,
-        "OpenEngine",
-        rect(24, 10, 290, 52),
-        p.text,
-        ui.display,
-        0,
+        [
+            POINT { x: 29, y: 51 },
+            POINT { x: 38, y: 34 },
+            POINT { x: 47, y: 51 },
+        ]
+        .as_ptr(),
+        3,
     );
-    let active = ui
-        .entries
-        .iter()
-        .find(|item| item.id == ui.active)
-        .map(|item| item.title.as_str())
-        .unwrap_or("Зимняя ночь");
-    text(
-        dc,
-        &format!("На рабочем столе  /  {active}"),
-        rect(width / 2, 17, width / 2 - 24, 40),
-        p.muted,
-        ui.body,
-        DT_RIGHT,
-    );
-    let left_width = ((width - 64) * 59 / 100).max(380);
-    let x = 40 + left_width;
-    let detail_w = width - x - 24;
-    fill(dc, rect(24, 74, left_width, height - 188), p.panel);
-    text(dc, "Библиотека", rect(37, 82, 190, 43), p.text, ui.title, 0);
-    fill(dc, rect(x, 74, detail_w, height - 188), p.panel);
-    let hero_width = detail_w - 32;
-    let hero_height = (hero_width * 9 / 16).min((height - 320).max(125));
-    let hero = rect(x + 16, 90, hero_width, hero_height);
-    if let Some(item) = ui.entries.get(ui.selected) {
-        preview(dc, hero, item, ui.display);
+    SelectObject(dc, old_pen);
+    SelectObject(dc, previous);
+    DeleteObject(mark);
+    text(dc, "OpenEngine", rect(64, 22, 130, 44), p.text, ui.title, 0);
+    if ui.preferences {
         text(
             dc,
-            &item.title,
-            rect(hero.left, hero.bottom + 12, hero_width, 38),
+            t("Настройки", "Settings", "设置"),
+            rect(l.x, 22, 360, 61),
+            p.text,
+            ui.display,
+            0,
+        );
+        rounded(dc, rect(l.x, 109, l.width - l.x - 28, 149), p.panel, 22);
+        text(
+            dc,
+            t("Цветовая тема", "Theme", "主题"),
+            rect(l.x + 24, 120, 280, 36),
             p.text,
             ui.title,
             0,
         );
         text(
             dc,
-            if item.path.is_some() {
-                "Локальное видео · зациклено · без звука"
-            } else {
-                "Встроенная сцена · падающий снег"
-            },
-            rect(hero.left, hero.bottom + 48, hero_width, 26),
+            t(
+                "Цвета окна, карточек и кнопок",
+                "Window, tile, and button colors",
+                "窗口、卡片与按钮的配色",
+            ),
+            rect(l.x + 24, 157, 390, 29),
             p.muted,
             ui.body,
             0,
         );
+        let half = (l.width - l.x - 45) / 2;
+        text(
+            dc,
+            t("Язык", "Language", "语言"),
+            rect(l.x + half + 23, 120, half - 10, 36),
+            p.text,
+            ui.title,
+            0,
+        );
+        rounded(dc, rect(l.x, 278, l.width - l.x - 28, 183), p.panel, 22);
+        text(
+            dc,
+            t("Качество видео", "Video quality", "视频画质"),
+            rect(l.x + 24, 288, 320, 36),
+            p.text,
+            ui.title,
+            0,
+        );
+        text(
+            dc,
+            t(
+                "Детальный режим сохраняет разрешение исходника до 3840 × 2160.",
+                "Detail mode preserves source resolution up to 3840 × 2160.",
+                "高清模式保留最高 3840 × 2160 的源分辨率。",
+            ),
+            rect(l.x + 24, 324, l.width - l.x - 67, 32),
+            p.muted,
+            ui.body,
+            0,
+        );
+        text(
+            dc,
+            t(
+                "Экономичный режим уменьшает нагрузку и размер кеша.",
+                "Low-memory mode reduces memory and cache size.",
+                "节省内存模式可减少内存与缓存占用。",
+            ),
+            rect(l.x + 24, 417, l.width - l.x - 67, 26),
+            p.muted,
+            ui.body,
+            0,
+        );
+        return;
     }
-    fill(dc, rect(24, height - 103, width - 48, 67), p.panel);
     text(
         dc,
-        "Тема интерфейса",
-        rect(40, height - 99, width - 320, 35),
+        t("Библиотека", "Library", "壁纸库"),
+        rect(l.x, 22, 360, 61),
         p.text,
-        ui.title,
+        ui.display,
         0,
     );
+    let count = ui.entries.len();
     text(
         dc,
-        "Цвета окна и библиотеки",
-        rect(40, height - 69, width - 320, 26),
+        &format!("{} · {count}", t("Обои в библиотеке", "Wallpapers", "壁纸")),
+        rect(l.x, 81, 310, 26),
         p.muted,
         ui.body,
         0,
     );
     text(
         dc,
+        t("Поиск", "Search", "搜索"),
+        rect(l.x, 114, 62, 32),
+        p.muted,
+        ui.body,
+        0,
+    );
+    if count == 0 {
+        text(
+            dc,
+            t(
+                "По этому запросу ничего не найдено",
+                "No matching wallpapers",
+                "未找到匹配的壁纸",
+            ),
+            rect(l.x + 8, 211, l.inspector - l.x - 22, 46),
+            p.muted,
+            ui.title,
+            0,
+        );
+    }
+    rounded(
+        dc,
+        rect(l.inspector, 102, l.width - l.inspector - 26, l.height - 138),
+        p.panel,
+        24,
+    );
+    let preview_width = l.width - l.inspector - 62;
+    let hero = rect(l.inspector + 18, 121, preview_width, preview_width * 9 / 16);
+    if let Some(item) = ui.entries.get(ui.selected) {
+        preview(dc, hero, item, ui.display);
+        let still = item.path.as_deref().is_some_and(data::is_still);
+        let meta = if still {
+            t(
+                "СТАТИЧНАЯ ТЕКСТУРА ИЗ СЦЕНЫ",
+                "STILL IMAGE FROM SCENE",
+                "场景静态纹理",
+            )
+        } else if item.path.is_none() {
+            t(
+                "ВСТРОЕННАЯ СЦЕНА · 4K",
+                "BUILT-IN SCENE · 4K",
+                "内置场景 · 4K",
+            )
+        } else {
+            t("ВИДЕО ИЗ БИБЛИОТЕКИ", "LIBRARY VIDEO", "壁纸库视频")
+        };
+        text(
+            dc,
+            meta,
+            rect(hero.left, hero.bottom + 17, preview_width, 24),
+            p.muted,
+            ui.body,
+            0,
+        );
+        text(
+            dc,
+            &item.title,
+            rect(hero.left, hero.bottom + 46, preview_width, 48),
+            p.text,
+            ui.display,
+            0,
+        );
+        let sub = if item.id == ui.active {
+            t("Сейчас на рабочем столе", "On your desktop", "当前桌面壁纸")
+        } else if still {
+            t(
+                "Фон без шейдеров и эффектов Wallpaper Engine",
+                "Still image without Wallpaper Engine effects",
+                "静态壁纸，不含 Wallpaper Engine 特效",
+            )
+        } else if item.path.is_some() {
+            t(
+                "Циклическое воспроизведение без звука",
+                "Loops without audio",
+                "静音循环播放",
+            )
+        } else {
+            t(
+                "Зимний пейзаж с анимацией снега",
+                "Winter landscape with falling snow",
+                "飘雪冬景",
+            )
+        };
+        text(
+            dc,
+            sub,
+            rect(hero.left, hero.bottom + 97, preview_width, 32),
+            p.muted,
+            ui.body,
+            0,
+        );
+    }
+    text(
+        dc,
         &ui.status,
-        rect(24, height - 30, width - 48, 24),
+        rect(l.x, l.height - 40, l.inspector - l.x - 22, 28),
         p.muted,
         ui.body,
         0,
@@ -687,12 +1203,12 @@ unsafe fn draw_item(args: &DRAWITEMSTRUCT, ui: &Library) {
     let row = args.rcItem;
     if args.CtlID as usize == LIST {
         let selected = args.itemState & ODS_SELECTED as u32 != 0;
-        fill(dc, row, p.panel);
+        fill(dc, row, p.canvas);
         let Some(item) = ui.entries.get(args.itemID as usize) else {
             return;
         };
         let tile = rect(row.left + 4, row.top + 3, CARD_W - 10, CARD_H - 9);
-        fill(dc, tile, if selected { p.card } else { p.canvas });
+        rounded(dc, tile, if selected { p.card } else { p.panel }, 16);
         if selected {
             fill(
                 dc,
@@ -700,14 +1216,14 @@ unsafe fn draw_item(args: &DRAWITEMSTRUCT, ui: &Library) {
                 p.accent,
             );
         }
-        let thumb = rect(tile.left + 7, tile.top + 9, tile.right - tile.left - 14, 84);
+        let thumb = rect(tile.left + 7, tile.top + 9, tile.right - tile.left - 14, 99);
         preview(dc, thumb, item, ui.body);
         text(
             dc,
             &item.title,
             rect(
                 tile.left + 8,
-                tile.top + 96,
+                tile.top + 108,
                 tile.right - tile.left - 15,
                 23,
             ),
@@ -716,18 +1232,20 @@ unsafe fn draw_item(args: &DRAWITEMSTRUCT, ui: &Library) {
             0,
         );
         let detail = if item.id == ui.active {
-            "На рабочем столе"
+            t("На рабочем столе", "On your desktop", "当前壁纸")
+        } else if item.path.as_deref().is_some_and(data::is_still) {
+            t("Статичные обои", "Still wallpaper", "静态壁纸")
         } else if item.path.is_some() {
-            "Видео"
+            t("Видео", "Video", "视频")
         } else {
-            "Сцена"
+            t("Сцена", "Scene", "场景")
         };
         text(
             dc,
             detail,
             rect(
                 tile.left + 8,
-                tile.top + 118,
+                tile.top + 132,
                 tile.right - tile.left - 15,
                 21,
             ),
@@ -738,12 +1256,42 @@ unsafe fn draw_item(args: &DRAWITEMSTRUCT, ui: &Library) {
     } else {
         let disabled = args.itemState & ODS_DISABLED as u32 != 0;
         let pressed = args.itemState & ODS_SELECTED as u32 != 0;
-        let color = if args.CtlID as usize == APPLY && !disabled && !pressed {
+        let id = args.CtlID as usize;
+        let navigation = id == GALLERY || id == SETTINGS;
+        let filter = (FILTER..FILTER + 3).contains(&id);
+        let color = if filter {
+            if id - FILTER == ui.filter {
+                p.card
+            } else {
+                p.panel
+            }
+        } else if navigation {
+            if pressed || (id == SETTINGS) == ui.preferences {
+                p.card
+            } else {
+                p.panel
+            }
+        } else if (id == APPLY || id == IMPORT) && !disabled && !pressed {
             p.accent
         } else {
             p.card
         };
-        fill(dc, row, color);
+        let inset = rect(
+            row.left + 1,
+            row.top + 1,
+            row.right - row.left - 2,
+            row.bottom - row.top - 2,
+        );
+        fill(
+            dc,
+            row,
+            if navigation || id == APPLY {
+                p.panel
+            } else {
+                p.canvas
+            },
+        );
+        rounded(dc, inset, color, 14);
         let mut label = [0u16; 80];
         let n = GetWindowTextW(args.hwndItem, label.as_mut_ptr(), label.len() as i32);
         text(

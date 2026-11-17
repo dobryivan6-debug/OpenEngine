@@ -6,8 +6,8 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::*,
 };
 
-pub const WIDTH: usize = 1600;
-pub const HEIGHT: usize = 900;
+pub const WIDTH: usize = 3840;
+pub const HEIGHT: usize = 2160;
 pub const FRAME_LEN: usize = WIDTH * HEIGHT * 3;
 pub const WINTER: &[u8; FRAME_LEN] = include_bytes!("../assets/winter.bgr");
 
