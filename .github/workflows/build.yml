@@ -1,0 +1,21 @@
+name: Windows build
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - name: Compile release binary
+        run: cargo +stable-x86_64-pc-windows-msvc build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenEngine-windows-x64
+          path: target/release/OpenEngine.exe
+          if-no-files-found: error
