@@ -1,12 +1,19 @@
 #![windows_subsystem = "windows"]
 
 mod archive;
+mod audio;
 mod data;
 mod desktop;
 mod i18n;
 mod library;
+mod particles;
+mod perf;
+mod scene;
+mod scene_gl;
 mod video;
 mod win;
+mod workshop;
+mod workshop_ui;
 
 fn main() {
     i18n::set(data::language());

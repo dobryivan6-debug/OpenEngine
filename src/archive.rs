@@ -1,17 +1,16 @@
 use crate::i18n::t;
 use std::{
     fs::{self, File},
-    io::{self, Cursor, Read, Write},
+    io::{self, Read},
     path::Path,
 };
 
-const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-const MAX_TEXTURE: u64 = 128 * 1024 * 1024;
 const MAX_VIDEO: u64 = 8 * 1024 * 1024 * 1024;
+pub const MAX_WORKSHOP_DOWNLOAD: u64 = 512 * 1024 * 1024;
 
 pub enum Source {
     Video(String),
-    Still,
+    Scene,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -43,6 +42,7 @@ pub fn unpack(path: &Path, folder: &Path) -> io::Result<(Option<String>, Source)
     let mut title = None;
     let mut preferred = None;
     let mut scene = false;
+    let mut scene_main = None;
     if let Some((i, name)) = project {
         let json = read(&mut zip.by_index(*i)?, 1024 * 1024)?;
         if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(
@@ -55,6 +55,7 @@ pub fn unpack(path: &Path, folder: &Path) -> io::Result<(Option<String>, Source)
             scene = meta["type"]
                 .as_str()
                 .is_some_and(|s| s.eq_ignore_ascii_case("scene"));
+            scene_main = meta["file"].as_str().and_then(scene_json);
             preferred = meta["file"].as_str().map(|file| {
                 let base = name.rsplit_once('/').map_or("", |(base, _)| base);
                 let file = file.replace('\\', "/");
@@ -105,15 +106,14 @@ pub fn unpack(path: &Path, folder: &Path) -> io::Result<(Option<String>, Source)
             .next()
             .is_some_and(|name| name.eq_ignore_ascii_case("scene.pkg"))
     }) {
-        let pkg = read(&mut zip.by_index(*i)?, MAX_TEXTURE)?;
-        let png = background(&pkg)?;
-        save_image(png, folder)?;
-        return Ok((title, Source::Still));
+        let pkg = read(&mut zip.by_index(*i)?, crate::scene::MAX_PACKAGE)?;
+        stage_scene(&pkg, folder, scene_main.as_deref())?;
+        return Ok((title, Source::Scene));
     }
     Err(invalid(t(
-        "В ZIP нет поддерживаемого видео или сцены Wallpaper Engine с PNG-текстурой.",
-        "The ZIP contains no supported video or Wallpaper Engine scene with a PNG texture.",
-        "ZIP 中没有支持的视频或包含 PNG 纹理的 Wallpaper Engine 场景。",
+        "В ZIP нет поддерживаемого видео или сцены Wallpaper Engine .",
+        "The ZIP contains no supported video or Wallpaper Engine scene.",
+        "ZIP 中没有支持的视频或Wallpaper Engine 场景。",
     )))
 }
 
@@ -144,96 +144,53 @@ fn read(file: &mut zip::read::ZipFile<'_, File>, limit: u64) -> io::Result<Vec<u
     Ok(bytes)
 }
 
-fn background(pkg: &[u8]) -> io::Result<&[u8]> {
-    fn bytes<'a>(pkg: &'a [u8], position: &mut usize, size: usize) -> Option<&'a [u8]> {
-        let end = position.checked_add(size)?;
-        let out = pkg.get(*position..end)?;
-        *position = end;
-        Some(out)
-    }
-    fn number(pkg: &[u8], position: &mut usize) -> Option<usize> {
-        Some(u32::from_le_bytes(bytes(pkg, position, 4)?.try_into().ok()?) as usize)
-    }
-    fn parse(pkg: &[u8]) -> Option<&[u8]> {
-        let mut pos = 0;
-        let magic_len = number(pkg, &mut pos)?;
-        let magic = bytes(pkg, &mut pos, magic_len)?;
-        if magic != b"PKGV0018" {
-            return None;
-        }
-        let count = number(pkg, &mut pos)?;
-        if count > 10000 {
-            return None;
-        }
-        let mut textures = Vec::new();
-        for _ in 0..count {
-            let len = number(pkg, &mut pos)?;
-            let name = bytes(pkg, &mut pos, len)?;
-            let start = number(pkg, &mut pos)?;
-            let length = number(pkg, &mut pos)?;
-            if name.ends_with(b".tex") {
-                textures.push((start, length));
-            }
-        }
-        textures
-            .into_iter()
-            .filter_map(|(offset, length)| {
-                let start = pos.checked_add(offset)?;
-                let texture = pkg.get(start..start.checked_add(length)?)?;
-                let png = &texture[texture
-                    .windows(PNG.len())
-                    .take(512)
-                    .position(|prefix| prefix == PNG)?..];
-                let w = u32::from_be_bytes(png.get(16..20)?.try_into().ok()?);
-                let h = u32::from_be_bytes(png.get(20..24)?.try_into().ok()?);
-                if !(4..=3840).contains(&w) || !(1..=2160).contains(&h) {
-                    return None;
-                }
-                Some((w * h, png))
-            })
-            .max_by_key(|(size, _)| *size)
-            .map(|(_, png)| png)
-    }
-    parse(pkg).ok_or_else(|| {
-        invalid(t(
-            "В сцене нет PNG-текстуры до 3840×2160. Этот тип сцены пока не поддерживается.",
-            "This scene has no supported PNG texture up to 3840×2160.",
-            "此场景没有受支持的 PNG 纹理（最高 3840×2160）。",
-        ))
-    })
+fn scene_json(name: &str) -> Option<String> {
+    (name.len() <= 2048 && name.to_ascii_lowercase().ends_with(".json"))
+        .then(|| name.replace('\\', "/"))
 }
 
-fn save_image(png: &[u8], folder: &Path) -> io::Result<()> {
-    let reader = image::ImageReader::with_format(Cursor::new(png), image::ImageFormat::Png);
-    let image = reader.decode().map_err(|_| {
-        invalid(t(
-            "Не удалось открыть текстуру PNG.",
-            "Could not open the PNG texture.",
-            "无法打开 PNG 纹理。",
-        ))
-    })?;
-    let width = image.width() & !3;
-    let height = image.height();
-    let thumb = image.resize_to_fill(
-        crate::video::THUMB_WIDTH as u32,
-        crate::video::THUMB_HEIGHT as u32,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let frame = image.crop_imm(0, 0, width, height).into_rgb8();
-    let mut pixels = frame.into_raw();
-    for pixel in pixels.chunks_exact_mut(3) {
-        pixel.swap(0, 2);
-    }
-    let mut output = File::create(folder.join("image.bgr"))?;
-    output.write_all(&width.to_le_bytes())?;
-    output.write_all(&height.to_le_bytes())?;
-    output.write_all(&pixels)?;
-    let mut preview = thumb.into_rgb8().into_raw();
-    for pixel in preview.chunks_exact_mut(3) {
-        pixel.swap(0, 2);
-    }
-    fs::write(folder.join("thumbnail.bgr"), preview)
+pub fn scene_entry(path: &Path) -> String {
+    fs::read_to_string(path.with_file_name("scene-main.txt"))
+        .ok()
+        .and_then(|name| scene_json(&name))
+        .unwrap_or_else(|| "scene.json".into())
 }
+
+pub fn stage_scene(pkg: &[u8], folder: &Path, main: Option<&str>) -> io::Result<()> {
+    use crate::scene::{Object, Package, Scene};
+    let package = Package::parse(pkg)?;
+    let main = main
+        .filter(|main| package.get(main).is_some())
+        .unwrap_or("scene.json");
+    let (scene, tracks) = Scene::load(&package, main)?;
+    if let Some(image) = scene
+        .objects
+        .iter()
+        .filter_map(|object| match object {
+            Object::Image(layer) => Some(&scene.images[layer.texture]),
+            _ => None,
+        })
+        .max_by_key(|image| u64::from(image.width()) * u64::from(image.height()))
+    {
+        let thumb = image::imageops::resize(
+            image,
+            crate::video::THUMB_WIDTH as u32,
+            crate::video::THUMB_HEIGHT as u32,
+            image::imageops::FilterType::Triangle,
+        );
+        let pixels: Vec<u8> = thumb
+            .as_raw()
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0]])
+            .collect();
+        fs::write(folder.join("thumbnail.bgr"), pixels)?;
+    }
+    drop(scene);
+    crate::audio::stage(&tracks, folder)?;
+    fs::write(folder.join("scene-main.txt"), main)?;
+    fs::write(folder.join("scene.pkg"), pkg)
+}
+
 pub fn unpack_project(source: &Path, staging: &Path) -> io::Result<(Option<String>, Source)> {
     use std::path::Component;
     let project = if source.is_dir() {
@@ -312,23 +269,14 @@ pub fn unpack_project(source: &Path, staging: &Path) -> io::Result<(Option<Strin
         .is_some_and(|kind| kind.eq_ignore_ascii_case("scene"))
     {
         let file = member("scene.pkg")?;
-        let mut data = Vec::new();
-        File::open(file)?
-            .take(MAX_TEXTURE + 1)
-            .read_to_end(&mut data)?;
-        if data.len() as u64 > MAX_TEXTURE {
-            return Err(invalid(t(
-                "scene.pkg слишком большой.",
-                "The scene.pkg file is too large.",
-                "scene.pkg 文件过大。",
-            )));
-        }
-        save_image(background(&data)?, staging)?;
-        return Ok((title, Source::Still));
+        let data = crate::scene::read_package(&file)?;
+        let main = json["file"].as_str().and_then(scene_json);
+        stage_scene(&data, staging, main.as_deref())?;
+        return Ok((title, Source::Scene));
     }
     Err(invalid(t(
-        "Проект не содержит поддерживаемого видео или PNG-текстуры.",
-        "The project has no supported video or PNG texture.",
-        "项目不含受支持的视频或 PNG 纹理。",
+        "Проект не содержит поддерживаемого видео или сцены.",
+        "The project has no supported video or scene.",
+        "项目不含受支持的视频或场景。",
     )))
 }

@@ -61,7 +61,7 @@ pub struct Video {
     playing: bool,
 }
 
-fn find_ffmpeg() -> Option<PathBuf> {
+pub(crate) fn find_ffmpeg() -> Option<PathBuf> {
     env::var_os("PATH").and_then(|path| {
         env::split_paths(&path)
             .filter(|dir| dir.is_absolute())

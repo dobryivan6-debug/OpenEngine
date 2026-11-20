@@ -38,6 +38,8 @@ const SETTINGS: usize = 107;
 const QUALITY: usize = 108;
 const FILTER: usize = 109;
 const LANGUAGE: usize = 112;
+const VOLUME: usize = 113;
+const WORKSHOP: usize = 114;
 const CARD_W: i32 = 208;
 const CARD_H: i32 = 174;
 
@@ -101,11 +103,15 @@ struct Library {
     query: String,
     filter: usize,
     filters: [HWND; 3],
+    metrics: std::sync::mpsc::Receiver<crate::perf::Snapshot>,
+    snapshot: crate::perf::Snapshot,
+    mark: HICON,
 }
 
 impl Drop for Library {
     fn drop(&mut self) {
         unsafe {
+            DestroyIcon(self.mark);
             DeleteObject(self.brush);
             for font in [self.body, self.title, self.display] {
                 DeleteObject(font);
@@ -248,6 +254,14 @@ unsafe fn init(hwnd: HWND) {
         BS_OWNERDRAW as u32,
     );
     let search = control(hwnd, SEARCH, "EDIT", "", WS_BORDER | ES_AUTOHSCROLL as u32);
+    let volume = control(hwnd, VOLUME, "COMBOBOX", "", CBS_DROPDOWNLIST as u32);
+    let workshop = control(
+        hwnd,
+        WORKSHOP,
+        "BUTTON",
+        "Steam Workshop",
+        BS_OWNERDRAW as u32,
+    );
     let quality = control(hwnd, QUALITY, "COMBOBOX", "", CBS_DROPDOWNLIST as u32);
     SendMessageW(
         search,
@@ -272,7 +286,7 @@ unsafe fn init(hwnd: HWND) {
     });
     let body = make_font(16, 400);
     for control in [
-        list, import, apply, combo, search, gallery, settings, quality,
+        list, import, apply, combo, search, gallery, settings, quality, volume, workshop,
     ] {
         SendMessageW(control, WM_SETFONT, body as usize, 0);
     }
@@ -310,6 +324,9 @@ unsafe fn init(hwnd: HWND) {
             query: String::new(),
             filter: 0,
             filters,
+            metrics: crate::perf::monitor(),
+            snapshot: Default::default(),
+            mark: crate::win::icon(),
         })
     });
     set_title_theme(hwnd, theme);
@@ -366,6 +383,23 @@ unsafe fn update_language(hwnd: HWND) {
         }
         SendMessageW(control, CB_SETCURSEL, index, 0);
     }
+    let volume = GetDlgItem(hwnd, VOLUME as i32);
+    SendMessageW(volume, CB_RESETCONTENT, 0, 0);
+    for label in [
+        t("Выключен", "Muted", "静音").to_owned(),
+        "25%".into(),
+        "50%".into(),
+        "75%".into(),
+        "100%".into(),
+    ] {
+        SendMessageW(volume, CB_ADDSTRING, 0, wide(&label).as_ptr() as LPARAM);
+    }
+    SendMessageW(
+        volume,
+        CB_SETCURSEL,
+        ((data::volume() + 12) / 25) as usize,
+        0,
+    );
     UI.with(|state| {
         if let Some(ui) = state.borrow_mut().as_mut() {
             ui.status.clear();
@@ -387,11 +421,11 @@ unsafe fn reload(hwnd: HWND, select: Option<&str>) {
             .filter(|item| {
                 item.title.to_lowercase().contains(&ui.query)
                     && match ui.filter {
-                        1 => item.path.as_deref().is_none_or(data::is_still),
-                        2 => item
+                        1 => item
                             .path
                             .as_deref()
-                            .is_some_and(|path| !data::is_still(path)),
+                            .is_none_or(|path| !data::is_video(path)),
+                        2 => item.path.as_deref().is_some_and(data::is_video),
                         _ => true,
                     }
             })
@@ -480,6 +514,7 @@ unsafe fn layout(hwnd: HWND) {
     };
     MoveWindow(gallery, 22, 108, 160, 44, 1);
     MoveWindow(settings, 22, 158, 160, 44, 1);
+    MoveWindow(GetDlgItem(hwnd, WORKSHOP as i32), 22, 208, 160, 44, 1);
     MoveWindow(import, l.width - 172, 32, 146, 42, 1);
     MoveWindow(
         search,
@@ -521,7 +556,9 @@ unsafe fn layout(hwnd: HWND) {
     for control in [list, import, apply, search] {
         ShowWindow(control, if preferences { SW_HIDE } else { SW_SHOW });
     }
-    for control in [combo, quality, language] {
+    let volume = GetDlgItem(hwnd, VOLUME as i32);
+    MoveWindow(volume, l.x + 24, 522, 255, 150, 1);
+    for control in [combo, quality, language, volume] {
         ShowWindow(control, if preferences { SW_SHOW } else { SW_HIDE });
     }
     for control in [gallery, settings] {
@@ -575,7 +612,7 @@ unsafe fn apply_selected(hwnd: HWND) {
     if item
         .path
         .as_deref()
-        .is_some_and(|path| !data::is_still(path) && !Video::available(path, data::quality()))
+        .is_some_and(|path| data::is_video(path) && !Video::available(path, data::quality()))
     {
         message(
             hwnd,
@@ -606,11 +643,11 @@ unsafe fn pick_video(hwnd: HWND) {
         return;
     }
     let filter = wide(&format!(
-        "{}\0*.mp4;*.m4v;*.wmv;*.webm;*.mkv;*.zip;project.json\0",
+        "{}\0*.mp4;*.m4v;*.wmv;*.webm;*.mkv;*.pkg;*.zip;project.json\0",
         t(
-            "Видео, ZIP и проекты",
-            "Videos, ZIP and projects",
-            "视频、ZIP 与项目"
+            "Видео, сцены, ZIP и проекты",
+            "Videos, scenes, ZIP and projects",
+            "视频、场景、ZIP 与项目"
         )
     ));
     let mut file = vec![0u16; 32768];
@@ -750,6 +787,10 @@ unsafe fn import_done(hwnd: HWND) {
 
 unsafe extern "system" fn procedure(hwnd: HWND, event: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match event {
+        crate::workshop_ui::LIBRARY_CHANGED => {
+            reload(hwnd, None);
+            0
+        }
         WM_DROPFILES => {
             drop_files(hwnd, wp as HDROP);
             0
@@ -841,6 +882,15 @@ unsafe extern "system" fn procedure(hwnd: HWND, event: u32, wp: WPARAM, lp: LPAR
                     });
                     reload(hwnd, None);
                 }
+                WORKSHOP if code == BN_CLICKED => crate::workshop_ui::open(hwnd),
+                VOLUME if code == CBN_SELCHANGE as u32 => {
+                    let index = SendMessageW(lp as HWND, CB_GETCURSEL, 0, 0);
+                    if (0..=4).contains(&index) {
+                        if let Err(error) = data::save_volume(index as u32 * 25) {
+                            message(hwnd, &error.to_string());
+                        }
+                    }
+                }
                 QUALITY if code == CBN_SELCHANGE as u32 => {
                     let index = SendMessageW(lp as HWND, CB_GETCURSEL, 0, 0);
                     if index >= 0 {
@@ -904,6 +954,11 @@ unsafe extern "system" fn procedure(hwnd: HWND, event: u32, wp: WPARAM, lp: LPAR
                 let Some(ui) = state.as_mut() else {
                     return false;
                 };
+                if let Ok(snapshot) = ui.metrics.try_recv() {
+                    ui.snapshot = snapshot;
+                    let sidebar = rect(0, monitor_top(client(hwnd).bottom) - 14, 204, 209);
+                    InvalidateRect(hwnd, &sidebar, 0);
+                }
                 if ui.active == id {
                     return false;
                 }
@@ -967,24 +1022,9 @@ unsafe fn paint_ui(dc: HDC, area: RECT, ui: &Library) {
     let l = Layout::new(area);
     fill(dc, area, p.canvas);
     fill(dc, rect(0, 0, 204, l.height), p.panel);
-    rounded(dc, rect(22, 28, 32, 32), p.accent, 10);
-    let mark = CreateSolidBrush(p.text);
-    let previous = SelectObject(dc, mark);
-    let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-    Polygon(
-        dc,
-        [
-            POINT { x: 29, y: 51 },
-            POINT { x: 38, y: 34 },
-            POINT { x: 47, y: 51 },
-        ]
-        .as_ptr(),
-        3,
-    );
-    SelectObject(dc, old_pen);
-    SelectObject(dc, previous);
-    DeleteObject(mark);
+    DrawIconEx(dc, 21, 27, ui.mark, 34, 34, 0, null_mut(), DI_NORMAL);
     text(dc, "OpenEngine", rect(64, 22, 130, 44), p.text, ui.title, 0);
+    paint_monitor(dc, area.bottom, ui, p);
     if ui.preferences {
         text(
             dc,
@@ -1027,7 +1067,7 @@ unsafe fn paint_ui(dc: HDC, area: RECT, ui: &Library) {
         rounded(dc, rect(l.x, 278, l.width - l.x - 28, 183), p.panel, 22);
         text(
             dc,
-            t("Качество видео", "Video quality", "视频画质"),
+            t("Качество рендера", "Render quality", "渲染质量"),
             rect(l.x + 24, 288, 320, 36),
             p.text,
             ui.title,
@@ -1055,6 +1095,15 @@ unsafe fn paint_ui(dc: HDC, area: RECT, ui: &Library) {
             rect(l.x + 24, 417, l.width - l.x - 67, 26),
             p.muted,
             ui.body,
+            0,
+        );
+        rounded(dc, rect(l.x, 475, l.width - l.x - 28, 104), p.panel, 22);
+        text(
+            dc,
+            t("Звук сцены", "Scene audio", "场景声音"),
+            rect(l.x + 24, 482, 320, 34),
+            p.text,
+            ui.title,
             0,
         );
         return;
@@ -1109,7 +1158,10 @@ unsafe fn paint_ui(dc: HDC, area: RECT, ui: &Library) {
     if let Some(item) = ui.entries.get(ui.selected) {
         preview(dc, hero, item, ui.display);
         let still = item.path.as_deref().is_some_and(data::is_still);
-        let meta = if still {
+        let live = item.path.as_deref().is_some_and(data::is_scene);
+        let meta = if live {
+            t("ИНТЕРАКТИВНАЯ СЦЕНА", "INTERACTIVE SCENE", "交互场景")
+        } else if still {
             t(
                 "СТАТИЧНАЯ ТЕКСТУРА ИЗ СЦЕНЫ",
                 "STILL IMAGE FROM SCENE",
@@ -1142,6 +1194,12 @@ unsafe fn paint_ui(dc: HDC, area: RECT, ui: &Library) {
         );
         let sub = if item.id == ui.active {
             t("Сейчас на рабочем столе", "On your desktop", "当前桌面壁纸")
+        } else if live {
+            t(
+                "Реагирует на клики по рабочему столу",
+                "Reacts to clicks on your desktop",
+                "响应桌面点击",
+            )
         } else if still {
             t(
                 "Фон без шейдеров и эффектов Wallpaper Engine",
@@ -1178,6 +1236,55 @@ unsafe fn paint_ui(dc: HDC, area: RECT, ui: &Library) {
         ui.body,
         0,
     );
+}
+
+fn monitor_top(height: i32) -> i32 {
+    (height - 223).max(269)
+}
+
+unsafe fn paint_monitor(dc: HDC, height: i32, ui: &Library, palette: &Palette) {
+    let top = monitor_top(height);
+    fill(dc, rect(24, top - 12, 152, 1), palette.card);
+    text(
+        dc,
+        t("Нагрузка OpenEngine", "OpenEngine load", "OpenEngine 负载"),
+        rect(24, top, 154, 24),
+        palette.muted,
+        ui.body,
+        0,
+    );
+    let units = t("МиБ", "MiB", "MiB");
+    for (index, (label, value, unit)) in [
+        ("RAM", ui.snapshot.ram, units),
+        ("VRAM", ui.snapshot.vram, units),
+        ("CPU", ui.snapshot.cpu, "%"),
+        ("GPU", ui.snapshot.gpu, "%"),
+        ("FPS", ui.snapshot.fps, ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let y = top + 34 + 26 * index as i32;
+        let value = value.map_or_else(
+            || "—".into(),
+            |v| {
+                if unit == units {
+                    format!("{v:.1} {unit}")
+                } else {
+                    format!("{v:.1}{unit}")
+                }
+            },
+        );
+        text(dc, label, rect(24, y, 60, 24), palette.muted, ui.body, 0);
+        text(
+            dc,
+            &value,
+            rect(83, y, 93, 24),
+            palette.text,
+            ui.body,
+            DT_RIGHT,
+        );
+    }
 }
 
 unsafe fn preview(dc: HDC, area: RECT, item: &Entry, font: HFONT) {
@@ -1233,6 +1340,8 @@ unsafe fn draw_item(args: &DRAWITEMSTRUCT, ui: &Library) {
         );
         let detail = if item.id == ui.active {
             t("На рабочем столе", "On your desktop", "当前壁纸")
+        } else if item.path.as_deref().is_some_and(data::is_scene) {
+            t("Живая сцена", "Live scene", "动态场景")
         } else if item.path.as_deref().is_some_and(data::is_still) {
             t("Статичные обои", "Still wallpaper", "静态壁纸")
         } else if item.path.is_some() {
@@ -1257,7 +1366,7 @@ unsafe fn draw_item(args: &DRAWITEMSTRUCT, ui: &Library) {
         let disabled = args.itemState & ODS_DISABLED as u32 != 0;
         let pressed = args.itemState & ODS_SELECTED as u32 != 0;
         let id = args.CtlID as usize;
-        let navigation = id == GALLERY || id == SETTINGS;
+        let navigation = id == GALLERY || id == SETTINGS || id == WORKSHOP;
         let filter = (FILTER..FILTER + 3).contains(&id);
         let color = if filter {
             if id - FILTER == ui.filter {
@@ -1266,7 +1375,7 @@ unsafe fn draw_item(args: &DRAWITEMSTRUCT, ui: &Library) {
                 p.panel
             }
         } else if navigation {
-            if pressed || (id == SETTINGS) == ui.preferences {
+            if pressed || (id != WORKSHOP && (id == SETTINGS) == ui.preferences) {
                 p.card
             } else {
                 p.panel

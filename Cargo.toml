@@ -14,9 +14,14 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+glow = "0.16"
+bcdec_rs = "0.2"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
 windows-sys = { version = "0.61", features = [
-  "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem",
+  "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Graphics_OpenGL", "Win32_Storage_FileSystem",
   "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security",
+  "Win32_Networking_WinHttp",
+  "Win32_System_Performance", "Win32_System_ProcessStatus",
   "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"
 ] }

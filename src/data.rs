@@ -105,6 +105,7 @@ pub fn media_for(id: &str) -> Option<PathBuf> {
         "video.wmv",
         "video.webm",
         "video.mkv",
+        "scene.pkg",
         "image.bgr",
     ]
     .into_iter()
@@ -149,6 +150,47 @@ pub fn entries() -> Vec<Entry> {
 }
 
 pub fn import(source: &Path) -> io::Result<String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    import_as(
+        source,
+        format!("{:032x}", (stamp << 32) | u128::from(std::process::id())),
+    )
+}
+
+pub fn import_workshop(source: &Path, item: u64) -> io::Result<String> {
+    let id = workshop_id(item);
+    if media_for(&id).is_some() {
+        return Ok(id);
+    }
+    import_as(source, id)
+}
+
+pub fn workshop_id(item: u64) -> String {
+    format!("{item:032x}")
+}
+
+pub fn workshop_queue() -> Vec<u64> {
+    fs::read_to_string(root().join("workshop-queue.txt"))
+        .unwrap_or_default()
+        .lines()
+        .take(64)
+        .filter_map(|line| line.parse().ok())
+        .collect()
+}
+
+pub fn save_workshop_queue(items: &[u64]) -> io::Result<()> {
+    let list = items
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_setting("workshop-queue.txt", &list)
+}
+
+fn import_as(source: &Path, id: String) -> io::Result<String> {
     let ext = source
         .extension()
         .and_then(|e| e.to_str())
@@ -158,7 +200,7 @@ pub fn import(source: &Path) -> io::Result<String> {
         || source
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("project.json"));
-    if !project && !["mp4", "m4v", "wmv", "webm", "mkv", "zip"].contains(&ext.as_str()) {
+    if !project && !["mp4", "m4v", "wmv", "webm", "mkv", "zip", "pkg"].contains(&ext.as_str()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             t(
@@ -168,11 +210,6 @@ pub fn import(source: &Path) -> io::Result<String> {
             ),
         ));
     }
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let id = format!("{:032x}", (stamp << 32) | u128::from(std::process::id()));
     let dir = root().join(&id);
     let staging = dir.with_extension("tmp");
     fs::create_dir_all(root())?;
@@ -182,6 +219,10 @@ pub fn import(source: &Path) -> io::Result<String> {
             crate::archive::unpack_project(source, &staging)?
         } else if ext == "zip" {
             crate::archive::unpack(source, &staging)?
+        } else if ext == "pkg" {
+            let raw = crate::scene::read_package(source)?;
+            crate::archive::stage_scene(&raw, &staging, None)?;
+            (None, crate::archive::Source::Scene)
         } else {
             let filename = format!("video.{ext}");
             fs::copy(source, staging.join(&filename))?;
@@ -195,7 +236,7 @@ pub fn import(source: &Path) -> io::Result<String> {
                 .into_owned()
         });
         let filename = match media {
-            crate::archive::Source::Still => "image.bgr".into(),
+            crate::archive::Source::Scene => "scene.pkg".into(),
             crate::archive::Source::Video(filename) => {
                 let video = staging.join(&filename);
                 let quality = quality();
@@ -219,6 +260,26 @@ pub fn import(source: &Path) -> io::Result<String> {
         let _ = fs::remove_dir_all(staging);
     }
     result
+}
+
+pub fn volume() -> u32 {
+    fs::read_to_string(root().join("volume.txt"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(100)
+}
+
+pub fn save_volume(volume: u32) -> io::Result<()> {
+    write_setting("volume.txt", &volume.min(100).to_string())
+}
+
+pub fn is_scene(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "pkg")
+}
+
+pub fn is_video(path: &Path) -> bool {
+    !is_still(path) && !is_scene(path)
 }
 
 pub fn is_still(path: &Path) -> bool {

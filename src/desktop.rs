@@ -6,6 +6,7 @@ use std::{
     mem::{size_of, zeroed},
     process::Command,
     ptr::{null, null_mut},
+    time::Instant,
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -33,9 +34,13 @@ struct Engine {
     quality: crate::video::Quality,
     video: Option<Video>,
     still: Option<crate::video::Frame>,
+    scene: Option<crate::scene_gl::Renderer>,
+    audio: crate::audio::Audio,
     tick: u32,
     taskbar_created: u32,
     size: (i32, i32),
+    frames: u32,
+    fps_since: Option<Instant>,
 }
 
 pub unsafe fn run(open: bool) {
@@ -81,7 +86,12 @@ pub unsafe fn run(open: bool) {
             open_library();
         }
         loop_messages();
-        ENGINE.with(|engine| engine.borrow_mut().video.take());
+        ENGINE.with(|engine| {
+            let mut state = engine.borrow_mut();
+            state.scene = None;
+            state.audio = Default::default();
+            state.video = None;
+        });
     }
     CloseHandle(mutex);
 }
@@ -253,19 +263,38 @@ unsafe extern "system" fn controller(hwnd: HWND, message: u32, wp: WPARAM, lp: L
             open_library();
             0
         }
+        crate::perf::WALLPAPER_FPS => ENGINE.with(|engine| {
+            let mut state = engine.borrow_mut();
+            let now = Instant::now();
+            let frames = std::mem::take(&mut state.frames);
+            state.fps_since.replace(now).map_or(0, |from| {
+                let elapsed = now.duration_since(from).as_secs_f64();
+                if elapsed < 0.05 {
+                    0
+                } else {
+                    (f64::from(frames) * 10.0 / elapsed).round() as LRESULT + 1
+                }
+            })
+        }),
         WM_TIMER => {
             if wp == WATCH {
                 refresh(hwnd);
             } else if wp == FRAME {
+                let interactive = desktop_focused();
                 let surface = ENGINE.with(|engine| {
                     let mut state = engine.borrow_mut();
-                    let updated = if let Some(video) = state.video.as_mut() {
+                    let updated = if let Some(scene) = state.scene.as_mut() {
+                        scene.draw(interactive)
+                    } else if let Some(video) = state.video.as_mut() {
                         video.update()
                     } else {
                         state.tick = state.tick.wrapping_add(1);
                         true
                     };
                     if updated {
+                        if !state.surface.is_null() {
+                            state.frames = state.frames.saturating_add(1);
+                        }
                         state.surface
                     } else {
                         null_mut()
@@ -282,6 +311,8 @@ unsafe extern "system" fn controller(hwnd: HWND, message: u32, wp: WPARAM, lp: L
             ENGINE.with(|engine| {
                 let mut state = engine.borrow_mut();
                 state.video.take();
+                state.scene.take();
+                state.audio = Default::default();
                 if IsWindow(state.surface) != 0 {
                     DestroyWindow(state.surface);
                 }
@@ -309,6 +340,7 @@ unsafe fn refresh(owner: HWND) {
     let size = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
     let id = data::active();
     let quality = data::quality();
+    let volume = data::volume();
     let covered = desktop_covered(size);
     let setup = ENGINE.with(|engine| {
         let state = engine.borrow();
@@ -318,6 +350,7 @@ unsafe fn refresh(owner: HWND) {
         if let Some((surface, host)) = attach(size) {
             ENGINE.with(|engine| {
                 let mut state = engine.borrow_mut();
+                state.active.clear();
                 state.surface = surface;
                 state.host = host;
                 state.size = size;
@@ -327,24 +360,51 @@ unsafe fn refresh(owner: HWND) {
     let mut resize = null_mut();
     let mut invalidate = null_mut();
     let mut fallback = false;
+    let mut scene_error = None;
     ENGINE.with(|engine| {
         let mut state = engine.borrow_mut();
         if state.size != size {
             resize = state.surface;
             state.size = size;
         }
-        if state.active != id || state.quality != quality {
+        if (state.active != id || state.quality != quality)
+            && !state.surface.is_null()
+            && IsWindow(state.surface) != 0
+        {
             state.quality = quality;
             state.video = None;
             state.still = None;
+            state.scene = None;
+            state.audio = Default::default();
+            if state.animating {
+                KillTimer(owner, FRAME);
+                state.animating = false;
+            }
             if let Some(path) = data::media_for(&id) {
                 if data::is_still(&path) {
                     state.still = data::read_still(&path);
+                } else if data::is_scene(&path) {
+                    match crate::scene_gl::Renderer::start(
+                        state.surface,
+                        &path,
+                        quality == crate::video::Quality::Low,
+                    ) {
+                        Ok(mut scene) => {
+                            scene.draw(false);
+                            state.scene = Some(scene);
+                            state.audio = crate::audio::Audio::open(&path);
+                        }
+                        Err(error) => scene_error = Some(error),
+                    }
                 } else {
                     state.video = Video::start(&path, quality).ok();
                 }
             }
-            if id != "winter" && state.video.is_none() && state.still.is_none() {
+            if id != "winter"
+                && state.video.is_none()
+                && state.still.is_none()
+                && state.scene.is_none()
+            {
                 fallback = true;
             }
             state.active = id;
@@ -363,9 +423,18 @@ unsafe fn refresh(owner: HWND) {
         if let Some(video) = state.video.as_mut() {
             video.play(play);
         }
+        state.audio.update(play, volume);
+        let interval = if state.scene.is_some() && quality != crate::video::Quality::Low {
+            33
+        } else {
+            66
+        };
         if state.animating != play {
             if play {
-                SetTimer(owner, FRAME, 66, None);
+                if let Some(scene) = state.scene.as_mut() {
+                    scene.reset_clock();
+                }
+                SetTimer(owner, FRAME, interval, None);
             } else {
                 KillTimer(owner, FRAME);
             }
@@ -388,6 +457,20 @@ unsafe fn refresh(owner: HWND) {
     }
     if fallback {
         let _ = data::select("winter");
+    }
+    if let Some(error) = scene_error {
+        crate::i18n::set(data::language());
+        message(
+            owner,
+            &format!(
+                "{}\n{error}",
+                t(
+                    "Не удалось запустить сцену.",
+                    "Could not start the scene.",
+                    "无法启动场景。",
+                )
+            ),
+        );
     }
 }
 
@@ -481,17 +564,19 @@ unsafe extern "system" fn find_shell(window: HWND, args: LPARAM) -> i32 {
     0
 }
 
-unsafe fn desktop_covered(size: (i32, i32)) -> bool {
+unsafe fn desktop_focused() -> bool {
     let window = GetForegroundWindow();
-    if window.is_null() {
-        return false;
-    }
     let mut name = [0u16; 64];
     let n = GetClassNameW(window, name.as_mut_ptr(), name.len() as i32);
-    if n > 0
-        && ["Progman", "WorkerW", "Shell_TrayWnd"]
-            .contains(&String::from_utf16_lossy(&name[..n as usize]).as_str())
-    {
+    n > 0
+        && [wide("Progman"), wide("WorkerW")]
+            .iter()
+            .any(|class| class.as_slice() == &name[..n as usize + 1])
+}
+
+unsafe fn desktop_covered(size: (i32, i32)) -> bool {
+    let window = GetForegroundWindow();
+    if window.is_null() || desktop_focused() {
         return false;
     }
     let mut area: RECT = zeroed();
@@ -509,28 +594,38 @@ unsafe extern "system" fn wallpaper(hwnd: HWND, event: u32, wp: WPARAM, lp: LPAR
         WM_PAINT => {
             let mut paint = zeroed();
             let dc = BeginPaint(hwnd, &mut paint);
-            let area = client(hwnd);
-            ENGINE.with(|engine| {
-                if let Ok(state) = engine.try_borrow() {
-                    if let Some(frame) = state.still.as_ref() {
-                        bitmap_size(dc, area, &frame.pixels, frame.width, frame.height);
-                    } else if let Some(video) = state.video.as_ref() {
-                        if let Some(frame) = video.frame.as_ref() {
-                            bitmap_size(dc, area, &frame.pixels, frame.width, frame.height);
-                        } else {
-                            bitmap(dc, area, WINTER);
-                        }
-                    } else {
-                        bitmap(dc, area, WINTER);
-                        snow(dc, area, state.tick);
-                    }
-                }
-            });
+            paint_wallpaper(dc, client(hwnd));
             EndPaint(hwnd, &paint);
+            0
+        }
+        WM_PRINTCLIENT => {
+            paint_wallpaper(wp as HDC, client(hwnd));
             0
         }
         _ => DefWindowProcW(hwnd, event, wp, lp),
     }
+}
+
+unsafe fn paint_wallpaper(dc: HDC, area: RECT) {
+    ENGINE.with(|engine| {
+        let Ok(state) = engine.try_borrow() else {
+            return;
+        };
+        if let Some(scene) = &state.scene {
+            scene.paint(dc, area);
+        } else if let Some(frame) = state
+            .still
+            .as_ref()
+            .or_else(|| state.video.as_ref().and_then(|video| video.frame.as_ref()))
+        {
+            bitmap_size(dc, area, &frame.pixels, frame.width, frame.height);
+        } else {
+            bitmap(dc, area, WINTER);
+            if state.video.is_none() {
+                snow(dc, area, state.tick);
+            }
+        }
+    });
 }
 
 unsafe fn snow(dc: HDC, area: RECT, tick: u32) {

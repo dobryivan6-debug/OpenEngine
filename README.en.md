@@ -24,7 +24,11 @@ OpenEngine copies each imported video and prepares a frame cache, so the library
 
 Drop videos, ZIP archives, or Wallpaper Engine project folders onto the library. Use **Add** to pick a `project.json` file. OpenEngine imports the video named in the project. Supported formats are MP4, M4V, WMV, WebM, and MKV.
 
-For supported PKGV0018 `scene.pkg` projects, OpenEngine extracts the largest supported PNG texture as a still wallpaper. Scene shaders, particles, and animation require Wallpaper Engine.
+Drop a `scene.pkg`, a scene ZIP, or a project folder onto the library. OpenEngine keeps the package and draws supported 2D scenes using OpenGL 3.0. It reads the original layers and masks, runs water ripple, displacement, and shake effects, and simulates particle emitters. Click an empty area of the desktop to make a ripple or hold the mouse button to push nearby particles.
+
+Set the soundtrack volume in **Settings → Scene audio**. Audio starts muted. Windows plays WAV and MP3. Importing OGG or FLAC soundtracks requires FFmpeg for conversion. Scene rendering runs in real time and supports a subset of the Wallpaper Engine format. Custom shaders, SceneScript, and 3D models are currently unsupported. Reimport the original package to upgrade entries previously imported as still images.
+
+Open **Steam Workshop** in the sidebar to search the Wallpaper Engine catalog and browse pages with previews. **Download** checks your local Steam libraries and downloads files when Steam provides a public URL. If Steam requires a subscription, OpenEngine opens the item's Steam page. Select **Subscribe** and OpenEngine imports the wallpaper once Steam finishes downloading it. Reopen Steam Workshop after restarting OpenEngine to resume checking pending items.
 
 ## Appearance
 
@@ -33,6 +37,8 @@ In Settings, choose the white or dark theme and switch between Russian, English,
 ## Rust, threads, and memory
 
 OpenEngine is written in Rust and uses Win32/GDI. The engine owns the desktop surface and tray icon. The library opens in a separate process that exits when you close the window.
+
+The sidebar monitor refreshes every second. RAM is the private working set of the engine and library, VRAM is dedicated video memory reported by Windows, and FPS counts wallpaper updates. Fullscreen pause shows 0 FPS. The scene renderer holds one finished frame and image textures, so memory use depends on render resolution and scene assets.
 
 - The window thread handles Windows messages, controls, and drawing. A background import thread copies the source file and prepares the frame cache, so the library remains responsive.
 - During playback, a worker reads JPEG frames from disk. It hands off just the newest decoded frame through a single slot protected by a `Mutex`. If drawing falls behind, the worker replaces the older frame, keeping memory bounded.

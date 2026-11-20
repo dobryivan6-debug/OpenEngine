@@ -24,13 +24,19 @@ OpenEngine 会复制导入的视频并生成帧缓存，因此壁纸库的磁盘
 
 把视频、ZIP 压缩包或 Wallpaper Engine 项目文件夹拖入壁纸库，也可以点击「添加」选择 `project.json`。OpenEngine 会导入项目指定的视频。支持 MP4、M4V、WMV、WebM 和 MKV。
 
-对于支持的 PKGV0018 格式 `scene.pkg` 项目，OpenEngine 可提取支持范围内最大的 PNG 纹理，设为静态壁纸。场景着色器、粒子和动画需要 Wallpaper Engine。
+将 `scene.pkg`、场景 ZIP 或项目文件夹拖入壁纸库。OpenEngine 保留场景包，通过 OpenGL 3.0 实时绘制支持的 2D 场景。它读取原始图层和遮罩，绘制水波、位移和抖动效果，并模拟粒子发射器。点击桌面空白处可产生涟漪，按住鼠标键可推开光标附近的粒子。
+
+在 **设置 → 场景声音** 中调节音量，默认静音。Windows 可直接播放 WAV 和 MP3。导入 OGG 或 FLAC 音轨时需要 FFmpeg 转换。目前支持部分 Wallpaper Engine 场景格式，自定义着色器、SceneScript 和 3D 模型暂不支持。对于此前以静态图片导入的壁纸，请重新导入原始场景包。
+
+从侧栏打开 **Steam Workshop**，即可搜索 Wallpaper Engine 创意工坊并分页浏览预览。点击 **下载** 后，OpenEngine 会检查本地 Steam 库，并尝试使用 Steam 提供的公开下载链接。如果 Steam 要求订阅，程序会打开该作品的 Steam 页面。点击 **订阅**，Steam 下载完成后 OpenEngine 会自动导入。重启 OpenEngine 后，重新打开 Steam Workshop 即可继续检查待下载项目。
 
 ## 界面与语言
 
 在设置中可以选择白色或深色主题，并切换俄语、英语及简体中文。卡片和壁纸预览面板参考了 [Lively Wallpaper](https://github.com/lively-community/lively/wiki/Getting-Started)。
 
 ## Rust、多线程和内存优化
+
+侧栏性能监视器每秒刷新。RAM 显示引擎和壁纸库进程的专用工作集，VRAM 显示 Windows 报告的专用显存，FPS 按壁纸更新次数计算。全屏暂停时显示 0 FPS。场景保留一张已绘制帧和纹理，内存用量取决于渲染分辨率和场景资源。
 
 OpenEngine 使用 Rust 开发，通过 Win32/GDI 绘制。引擎负责桌面壁纸和通知区域图标。壁纸库按需启动独立进程，关闭窗口后该进程退出。
 
