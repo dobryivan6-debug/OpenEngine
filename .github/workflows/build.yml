@@ -39,9 +39,15 @@ jobs:
           path: dist
       - name: Archive sources
         run: git archive --format=zip --prefix=OpenEngine/ --output=dist/OpenEngine-source.zip HEAD
+      - name: Package Windows application
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package/OpenEngine -Force | Out-Null
+          Copy-Item dist/OpenEngine.exe,README.md,README.en.md,README.zh-CN.md,LICENSE package/OpenEngine/
+          Compress-Archive -Path package/OpenEngine -DestinationPath dist/OpenEngine-windows-x64.zip
       - name: Publish release files
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME --verify-tag --generate-notes dist/OpenEngine.exe dist/OpenEngine-source.zip
+          gh release create $env:GITHUB_REF_NAME --verify-tag --title "OpenEngine $env:GITHUB_REF_NAME" --notes-file docs/releases/v0.5.0.md dist/OpenEngine.exe dist/OpenEngine-windows-x64.zip dist/OpenEngine-source.zip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
