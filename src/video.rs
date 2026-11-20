@@ -6,7 +6,7 @@ use std::{
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Condvar, Mutex},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Condvar, Mutex, MutexGuard, TryLockError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -15,6 +15,24 @@ pub const THUMB_WIDTH: usize = 320;
 pub const THUMB_HEIGHT: usize = 180;
 const STEP: Duration = Duration::from_millis(66);
 const MAX_JPEG: usize = 32 * 1024 * 1024;
+
+// Serialize cache creation in this process. Preparation is infrequent, so a
+// global lock avoids path-key normalization and per-path lock-lifetime issues.
+static CACHE_LOCK: Mutex<()> = Mutex::new(());
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn lock_cache(cancelled: &impl Fn() -> bool) -> io::Result<MutexGuard<'static, ()>> {
+    loop {
+        if cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Video preparation cancelled."));
+        }
+        match CACHE_LOCK.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Quality {
@@ -136,18 +154,31 @@ pub fn prepare_cache(
     quality: Quality,
     cancelled: impl Fn() -> bool,
 ) -> io::Result<PathBuf> {
-    let cache = quality.cache();
-    let target = path.with_file_name(cache);
+    let _cache_guard = lock_cache(&cancelled)?;
+    let target = path.with_file_name(quality.cache());
     if target.is_file() {
         return Ok(target);
     }
-    let temp = path.with_file_name(format!("{cache}.{}.tmp", std::process::id()));
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
+
+    // Unique create_new names avoid collisions with stale files and other processes.
+    let (temp, file) = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = path.with_file_name(format!(
+            "{}.{}.{}.tmp",
+            quality.cache(),
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
     let result = (|| {
-        let mut child = ffmpeg(path)?
+        let mut command = ffmpeg(path)?;
+        command
             .args([
                 "-vf",
                 quality.filter(),
@@ -158,19 +189,19 @@ pub fn prepare_cache(
                 "-q:v",
                 if quality == Quality::Detail { "2" } else { "8" },
                 "-pix_fmt",
-                if quality == Quality::Detail {
-                    "yuvj444p"
-                } else {
-                    "yuvj420p"
-                },
+                if quality == Quality::Detail { "yuvj444p" } else { "yuvj420p" },
                 "-f",
                 "mpjpeg",
                 "-boundary_tag",
                 "openengine",
                 "pipe:1",
             ])
-            .stdout(Stdio::from(file))
-            .spawn()?;
+            .stdout(Stdio::from(file));
+
+        let mut child = command.spawn()?;
+        // Do not retain the parent's copy of the stdout handle during rename.
+        drop(command);
+
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -189,6 +220,7 @@ pub fn prepare_cache(
             }
             thread::sleep(Duration::from_millis(70));
         };
+
         if !status.success() || fs::metadata(&temp)?.len() < 100 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -199,13 +231,13 @@ pub fn prepare_cache(
                 ),
             ));
         }
-        match fs::rename(&temp, &target) {
-            Ok(()) => Ok(target),
-            Err(_) if target.is_file() => Ok(target),
-            Err(error) => Err(error),
-        }
+
+        // A failed replacement leaves the existing target untouched.
+        fs::rename(&temp, &target)?;
+        Ok(target.clone())
     })();
-    let _ = fs::remove_file(temp);
+
+    let _ = fs::remove_file(&temp);
     result
 }
 
